@@ -1,1 +1,1 @@
-# This folder contains some of the Sagemaker pnotebooks 
+## This folder contains some of the Sagemaker notebooks 

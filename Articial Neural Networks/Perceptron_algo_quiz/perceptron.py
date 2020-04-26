@@ -1,4 +1,7 @@
 import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
 # Setting the random seed, feel free to change it and see different solutions.
 np.random.seed(42)
 
@@ -16,7 +19,16 @@ def prediction(X, W, b):
 # update the weights and bias W, b, according to the perceptron algorithm,
 # and return W and b.
 def perceptronStep(X, y, W, b, learn_rate = 0.01):
-    # Fill in code
+    for i in range(len(X)):
+        y_hat = prediction(X[i],W,b)
+        if y[i]-y_hat == 1:
+            W[0] += X[i][0]*learn_rate
+            W[1] += X[i][1]*learn_rate
+            b += learn_rate
+        elif y[i]-y_hat == -1:
+            W[0] -= X[i][0]*learn_rate
+            W[1] -= X[i][1]*learn_rate
+            b -= learn_rate
     return W, b
     
 # This function runs the perceptron algorithm repeatedly on the dataset,
@@ -36,3 +48,28 @@ def trainPerceptronAlgorithm(X, y, learn_rate = 0.01, num_epochs = 25):
         W, b = perceptronStep(X, y, W, b, learn_rate)
         boundary_lines.append((-W[0]/W[1], -b/W[1]))
     return boundary_lines
+
+data = pd.read_csv('data.csv')
+y = data.iloc[:,2]
+y = y.to_numpy()
+x = data.iloc[:,:-1]
+x = x.to_numpy()
+x_new = np.zeros((x.shape[0]+1,2))
+x_new[0][:] = [0.78051,-0.063669]
+x_new[1:][:] = x
+y_new = np.zeros(y.shape[0]+1)
+y_new[0] = 1
+y_new[1:] = y
+params = trainPerceptronAlgorithm(x_new,y_new,0.01,100)
+
+
+colors = [i for i in y_new]
+for i in range(len(params)): 
+    plt.clf()
+    plt.scatter(x_new[:,0],x_new[:,1],c=colors)
+    slope, intercept = params[i][0].item(),params[i][1].item()
+    ys = x_new *slope + intercept
+    plt.plot(x_new,ys)
+    plt.draw()
+    plt.pause(0.1)
+plt.show()

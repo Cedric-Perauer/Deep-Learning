@@ -49,7 +49,7 @@ for bagFile in listOfBagFiles:
 
 
 	#create a new directory
-	folder = string.rstrip(bagName, ".bag")
+	folder = str.rstrip(bagName, ".bag")
 	try:	#else already exists
 		os.makedirs(folder)
 	except:
@@ -66,7 +66,7 @@ for bagFile in listOfBagFiles:
 
 	for topicName in listOfTopics:
 		#Create a new CSV file for each topic
-		filename = folder + '/' + string.replace(topicName, '/', '_slash_') + '.csv'
+		filename = folder + '/' + str.replace(topicName, '/', '_slash_') + '.csv'
 		with open(filename, 'w+') as csvfile:
 			filewriter = csv.writer(csvfile, delimiter = ',')
 			firstIteration = True	#allows header row
@@ -74,12 +74,12 @@ for bagFile in listOfBagFiles:
 				#parse data from this instant, which is of the form of multiple lines of "Name: value\n"
 				#	- put it in the form of a list of 2-element lists
 				msgString = str(msg)
-				msgList = string.split(msgString, '\n')
+				msgList = str.split(msgString, '\n')
 				instantaneousListOfData = []
 				for nameValuePair in msgList:
-					splitPair = string.split(nameValuePair, ':')
+					splitPair = str.split(nameValuePair, ':')
 					for i in range(len(splitPair)):	#should be 0 to 1
-						splitPair[i] = string.strip(splitPair[i])
+						splitPair[i] = str.strip(splitPair[i])
 					instantaneousListOfData.append(splitPair)
 				#write the first row from the first element of each pair
 				if firstIteration:	# header

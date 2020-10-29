@@ -1,7 +1,7 @@
 import  torch 
 import torchvision.transforms as transforms
 import torch.optim as optim
-import torch.transforms.functional as FT 
+import torchvision.transforms.functional as FT 
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from model import YOLOv1
@@ -79,15 +79,15 @@ def main():
                                 img_dir=img_dir,
                                 label_dir=label_dir)
 
-    train_loader = DataLoader(dataset=train_dataset,batch_size=bs,num_workers=num_workers,shuffle=True,drop_last=True)
+    train_loader = DataLoader(dataset=train_dataset,batch_size=bs,num_workers=num_workers,shuffle=True,drop_last=False)
     test_loader = DataLoader(dataset=test_dataset,batch_size=bs,num_workers=num_workers,shuffle=True,drop_last=True)
 
     for epoch in range(epochs):
-        pred_boxes,target_boxes = get_bboxes(train_loader,model,iou_threshold=0.5,threshol=0.4)
+        pred_boxes,target_boxes = get_bboxes(train_loader,model,iou_threshold=0.5,threshold=0.4)
         mean_avg_prec = mean_average_precision(pred_boxes,target_boxes,iou_threshold=0.5,box_format="midpoint")
         print(f"Train mAP: {mean_avg_prec}")
 
         train_fn(train_loader,model,optimizer,loss_fn)
 
-if __name__ == "__main__"
+if __name__ == "__main__":
     main()

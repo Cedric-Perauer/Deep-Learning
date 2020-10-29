@@ -5,6 +5,8 @@ from utils import  intersection_over_union
 #credits to Alladin Person, check out his tutorial ! 
 class YoloLoss(nn.Module): 
     def __init__(self,S=7,B=2,C=20):
+        super(YoloLoss,self).__init__()
+
         self.mse = nn.MSELoss(reduction="sum")
         self.S = S
         self.B = B
@@ -29,7 +31,7 @@ class YoloLoss(nn.Module):
         box_preds[...,2:4] = torch.sign(box_preds[...,2:4]) * torch.sqrt(
                 torch.abs(box_preds[...,2:4] + 1e-6)) 
         
-        box_targets[...,2:4] = torch.sqrt(box_targets[..,2:4]) 
+        box_targets[...,2:4] = torch.sqrt(box_targets[...,2:4]) 
         
         box_loss = self.mse(torch.flatten(box_preds,end_dim=-2),torch.flatten(box_targets,end_dim=-2))
 

@@ -10,6 +10,7 @@ from utils import (
         intersection_over_union,
         non_max_suppression,
         cellboxes_to_boxes,
+        mean_average_precision,
         get_bboxes,
         plot_image,
         save_checkpoint,
@@ -23,7 +24,7 @@ torch.manual_seed(seed)
 
 #Hyperparams 
 learning_rate = 2e-5
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available else "cpu"
 bs = 16 
 wd = 0 
 epochs = 100
@@ -35,14 +36,15 @@ img_dir = "data/images"
 label_dir = "data/labels" 
 
 class Compose(object): 
-    def __init__(self,transform):
+    def __init__(self,transforms):
             self.transforms = transforms
 
     def __call__(self,img,bboxes):
         for t in self.transforms:
             img,bboxes = t(img),bboxes
+        return img,bboxes
 
-transform = Compose([transforms.Resize((448,448)),transforms.ToTensor()])
+transform = Compose([transforms.Resize((448,448)),transforms.ToTensor(),])
 
 def train_fn(train_loader,model,optim,loss_fn):
     loop = tqdm(train_loader,leave=True)
@@ -51,16 +53,16 @@ def train_fn(train_loader,model,optim,loss_fn):
     for batch_idx,(x,y) in enumerate(loop):
         x,y = x.to(device),y.to(device)
         out=model(x)
-        loss=loss_fn(x,y)
+        loss=loss_fn(out,y)
         mean_loss.append(loss)
-        optimizer.zero_grad()
+        optim.zero_grad()
         loss.backward()
-        optimizer.step()
+        optim.step()
 
         #update the tqdm bar 
         loop.set_postfix(loss=loss.item())
 
-    print(f"Mean loss was {sum(mean)/len(mean_loss)}") 
+    print(f"Mean loss was {sum(mean_loss)/len(mean_loss)}") 
     
 def main():
     model = YOLOv1(split_size=7,num_boxes=2,num_classes=20).to(device)
@@ -79,8 +81,8 @@ def main():
                                 img_dir=img_dir,
                                 label_dir=label_dir)
 
-    train_loader = DataLoader(dataset=train_dataset,batch_size=bs,num_workers=num_workers,shuffle=True,drop_last=False)
-    test_loader = DataLoader(dataset=test_dataset,batch_size=bs,num_workers=num_workers,shuffle=True,drop_last=True)
+    train_loader = DataLoader(dataset=train_dataset,batch_size=bs,num_workers=num_workers,pin_memory=pin_mem,shuffle=True,drop_last=False)
+    test_loader = DataLoader(dataset=test_dataset,batch_size=bs,num_workers=num_workers,pin_memory=pin_mem,shuffle=True,drop_last=True)
 
     for epoch in range(epochs):
         pred_boxes,target_boxes = get_bboxes(train_loader,model,iou_threshold=0.5,threshold=0.4)

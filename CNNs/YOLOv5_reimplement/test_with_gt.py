@@ -4,7 +4,7 @@ import json
 import os
 import shutil
 from pathlib import Path
-
+import cv2
 import numpy as np
 import torch
 import yaml
@@ -14,7 +14,7 @@ from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import (
     coco80_to_coco91_class, check_dataset, check_file, check_img_size, compute_loss, non_max_suppression, scale_coords,
-    xyxy2xywh, clip_coords,plot_single_images_with_gt,plot_images_with_gt,plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
+    xyxy2xywh,plot_one_box, clip_coords,plot_single_images_with_gt,plot_images_with_gt,plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
 from utils.torch_utils import select_device, time_synchronized
 from utils.datasets import LoadStreams, LoadImages
 import random 
@@ -82,7 +82,7 @@ class Metrics():
 
 class Test(Metrics):
     def __init__(self,data,weights=None,batch_size=16,
-            img_size=640,conf_thresh=0.001,iou_thresh=0.6,single_cls=False,
+            img_size=640,conf_thresh=0.25,iou_thresh=0.6,single_cls=False,
             augment=False,verbose=False,model=None,dataloader=None,
             save_dir=Path(''),save_txt=False,save_conf=False,plots=True):
         
@@ -176,25 +176,25 @@ class Test(Metrics):
 
     def plot_images(self):
         f = self.save_dir / f'test_batch_compare_{self.batch_idx}.jpg'
-        colors = [[random.randint(0, 255) for _ in range(3)] for _ in range(len(self.names))]
+        colors = [(255,0,0),(0,165,255),(0,0,255),(0,204,204),(0,255,0)]
         for p in self.paths :
             dataset = LoadImages(p,img_size=self.img_size)
             img = torch.zeros((1, 3, self.img_size, self.img_size), device=self.device)  # init img
             out = [] #use this to store all detections for BB
             for path, img, im0s, vid_cap in dataset:
+                image = cv2.imread(path) 
+                h, w , _ = image.shape
                 img = torch.from_numpy(img).to(self.device)
                 img = img.half() if self.half else img.float()  # uint8 to fp16/32
                 img /= 255.0  # 0 - 255 to 0.0 - 1.0
                 if img.ndimension() == 3:
                     img = img.unsqueeze(0)
-
+                
                 # Inference
                 pred = self.model(img, augment=False)[0]
 
                 # Apply NMS
                 pred = non_max_suppression(pred, self.conf_thresh, self.iou_thresh)
-
-
                 # Process detections
                 for i, det in enumerate(pred):  # detections per image
                     p, s, im0 = path, '', im0s
@@ -203,10 +203,30 @@ class Test(Metrics):
                     if det is not None and len(det):
                         # Rescale boxes from img_size to im0 size
                         det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-            if det is None : 
-                return None,None
-            out = torch.cat((det[:,:4],det[:,-1].unsqueeze(1)),dim=1)
-            return out, im0.shape #bounding boxes output 
+                        # Write results
+                        for *xyxy, conf, cls in reversed(det):
+                                label = '%s %.2f' % (self.names[int(cls)], conf)
+                                if conf > self.conf_thresh : 
+                                    im0 = plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
+                label_file = p.split("/")
+                img_name = label_file[-1]
+                label_file[-3],label_file[-1] = "labels", label_file[-1][:-3] + "txt"
+                seperator = "/"
+                file_path = seperator.join(label_file) 
+                with open(file_path,"r") as f :
+                    content = f.readlines() 
+                    for line in content :
+                        arr = line.split(" ") 
+                        x,y,w_i,h_i = float(arr[1]),float(arr[2]),float(arr[3]),float(arr[4]) 
+                        cx,cy = x * w, y * h 
+                        box_w, box_h = w_i/2 * w, h_i/2 * h 
+                        tl_x,tl_y = int(cx - box_w), int(cy-box_h) 
+                        br_x,br_y = int(cx + box_w), int(cy+box_h) 
+                        tl = (tl_x,tl_y) 
+                        br = (br_x,br_y) 
+
+                        im0 = cv2.rectangle(im0,tl,br,(0,200,0),5)
+            cv2.imwrite("runs/test/compare/" + img_name ,im0)     
 
     def compute_stats(self,output):
         whwh = torch.Tensor([self.w,self.h,self.w,self.h]).to(device = self.device) 
@@ -267,7 +287,7 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='*.data path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.001, help='object confidence threshold')
+    parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
     parser.add_argument('--task', default='val', help="'val', 'test', 'study'")

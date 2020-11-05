@@ -47,10 +47,11 @@ class Metrics():
         self.targets = None
         self.names = None
         self.batch_size = 16 
-        self.num_classes = 1
+        self.num_classes = 5
         self.seen = 0
         self.img_size = 0 
-        self.save_dir = None 
+        self.save_dir = None
+        self.tags_ious = {0:[],1:[],2:[],3:[]} #tracks  
 
     def metrics_compute(self,plots,*args):
         self.stats = [np.concatenate(x, 0) for x in zip(*self.stats)]  # to numpy
@@ -67,10 +68,11 @@ class Metrics():
         print(pf % ('all', self.seen, nt.sum(), mp, mr, map50, map))
 
         # Print results per class
-        if self.verbose and self.num_classes > 1 and len(self.stats):
+        if  self.num_classes > 1 and len(self.stats):
             for i, c in enumerate(ap_class):
                 print(pf % (self.names[c], self.seen, nt[c], p[i], r[i], ap50[i], ap[i]))
-
+        
+        print(pf % ("all without unknown", self.seen, 0, sum(p[:-1])/4, sum(r[:-1])/4, sum(ap50[:-1])/4, sum(ap[:-1])/4))
         # Print speeds
         t = tuple(x / self.seen * 1E3 for x in (self.t_model,self.t_nms, self.t_model + self.t_nms)) + (self.img_size, self.img_size, self.batch_size)  # tuple
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
@@ -82,8 +84,8 @@ class Metrics():
 
 class Test(Metrics):
     def __init__(self,data,weights=None,batch_size=16,
-            img_size=640,conf_thresh=0.25,iou_thresh=0.6,single_cls=False,
-            augment=False,verbose=False,model=None,dataloader=None,
+            img_size=640,conf_thresh=0.001,iou_thresh=0.6,single_cls=False,
+            augment=False,verbose=True,model=None,dataloader=None,
             save_dir=Path(''),save_txt=False,save_conf=False,plots=True):
         
         super(Test,self).__init__()
@@ -106,6 +108,8 @@ class Test(Metrics):
         self.batch_idx = None 
         self.paths = None 
         self.im = None 
+        self.tags = None
+        self.tag_mode = True
 
     def track_data(self):     
         set_logging()
@@ -146,8 +150,14 @@ class Test(Metrics):
         self.loss = torch.zeros(3,device=self.device) 
         for self.batch_idx, (data) in enumerate(tqdm(dataloader,desc=s)):
             self.batch_compute(data)
-        
-        self.metrics_compute(self.plots)
+        if not self.tag_mode : 
+            self.metrics_compute(self.plots)
+        else : 
+            print("Average IOU for sticker band removed cones %0.3f, number of targets is %f:"% (sum(self.tags_ious[0])/len(self.tags_ious[0]),len(self.tags_ious[0]))) 
+            print("Average IOU for knocked over cones %0.3f, number of targets is %f:"% (sum(self.tags_ious[1])/len(self.tags_ious[1]),len(self.tags_ious[1])))
+            print("Average IOU for truncated removed cones %0.3f, number of targets is %f:" % (sum(self.tags_ious[2])/len(self.tags_ious[2]),len(self.tags_ious[2])))
+            print("Average IOU for normal cones %0.3f, number of targets is %f:"% (sum(self.tags_ious[3])/len(self.tags_ious[3]),len(self.tags_ious[3])))
+
 
     def img_preprocess(self,img):
         img = img.to(self.device,non_blocking=True)
@@ -156,10 +166,10 @@ class Test(Metrics):
         return img 
 
     def batch_compute(self,*args):
-        img,targets,self.paths,shapes = args[0] #data
+        img,targets,self.paths,shapes, self.tags = args[0] #data
         self.img = self.img_preprocess(img)
         self.targets = targets.to(self.device) 
-        _ , _, self.h,self.w = img.shape #order is batch size,channels (already known from init and image), height,width 
+        _ , _, self.h,self.w = self.img.shape #order is batch size,channels (already known from init and image), height,width 
         
 
         with torch.no_grad(): 
@@ -172,7 +182,8 @@ class Test(Metrics):
             t = time_synchronized()
             output = non_max_suppression(inf_out,conf_thres=self.conf_thresh,iou_thres=self.iou_thresh)
             self.t_nms += time_synchronized() - t
-            self.compute_stats(output) 
+            #self.compute_stats(output) 
+            self.compute_stats_tags(output) 
 
     def plot_images(self):
         f = self.save_dir / f'test_batch_compare_{self.batch_idx}.jpg'
@@ -228,6 +239,69 @@ class Test(Metrics):
                         im0 = cv2.rectangle(im0,tl,br,(0,200,0),5)
             cv2.imwrite("runs/test/compare/" + img_name ,im0)     
 
+    def compute_stats_tags(self,output):
+        whwh = torch.Tensor([self.w,self.h,self.w,self.h]).to(device = self.device) 
+        c = 0 
+        for si, pred in enumerate(output):
+            labels = self.targets[self.targets[:,0] == si,1:] #label for corresponding index 
+            nl = len(labels) 
+            self.tags[c] = [3 if i==-1 else i for i in self.tags[c]]
+            tcls = self.tags[c] if nl else []
+             
+            self.seen += 1 
+            
+            if pred is None : 
+                if nl : 
+                    self.stats.append((torch.zeros(0,self.niou,dtype=torch.bool),torch.Tensor(),torch.Tensor(),tcls))
+                continue
+
+            #clip boxes to image bounds 
+            clip_coords(pred,(self.h,self.w))
+            
+
+            # Assign all predictions as incorrect
+            correct = torch.zeros(pred.shape[0], self.niou, dtype=torch.bool, device=self.device)
+            if nl:
+                detected = []  # target indices
+                tcls_tensor = torch.Tensor(tcls).to(self.device) 
+                # target boxes
+                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+
+                # Per target class
+                box_ious = []
+                box_ious1 = []
+                for cls in torch.unique(tcls_tensor):
+                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    pi = (pred[:, 5] != 10).nonzero(as_tuple=False).view(-1)  # target indices
+                    # Search for detections
+
+                    if pi.shape[0]:
+                        ious, i = box_iou(tbox[ti],pred[pi, :4]).max(1)  # best ious, indices
+                        # Prediction to target ious
+                        for iou in ious : 
+                            self.tags_ious[int(cls.item())].append(iou.item())
+            c += 1 
+            # Append statistics (correct, conf, pcls, tcls)
+            #if self.plots : 
+                #self.plot_images()
+    def box_single_iou(self,boxA,boxB) : 
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+	# compute the area of intersection rectangle
+        interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+	# compute the area of both the prediction and ground-truth
+	# rectangles
+        boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+        boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+	# compute the intersection over union by taking the intersection
+	# area and dividing it by the sum of prediction + ground-truth
+	# areas - the interesection area
+        iou = interArea / float(boxAArea + boxBArea - interArea)
+	# return the intersection over union value
+        return iou
+
     def compute_stats(self,output):
         whwh = torch.Tensor([self.w,self.h,self.w,self.h]).to(device = self.device) 
         for si, pred in enumerate(output):
@@ -254,43 +328,42 @@ class Test(Metrics):
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-
+                
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
                     pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
-
                     # Search for detections
                     if pi.shape[0]:
                         # Prediction to target ious
                         ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
-
                         # Append detections
+                        ind = i 
                         detected_set = set()
                         for j in (ious > self.iouv[0]).nonzero(as_tuple=False):
-                            d = ti[i[j]]  # detected target
+                             
+                            d = ti[ind[j]]  # detected target
                             if d.item() not in detected_set:
                                 detected_set.add(d.item())
                                 detected.append(d)
                                 correct[pi[j]] = ious[j] > self.iouv  # iou_thres is 1xn
                                 if len(detected) == nl:  # all targets already located in image
                                     break
-            
             # Append statistics (correct, conf, pcls, tcls)
             self.stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-            if self.plots : 
-                self.plot_images()
+            #if self.plots : 
+                #self.plot_images()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='*.data path')
+    parser.add_argument('--data', type=str, default='data/fsd.yaml', help='*.data path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
     parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
-    parser.add_argument('--task', default='val', help="'val', 'test', 'study'")
+    parser.add_argument('--task', default='test', help="'val', 'test', 'study'")
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
     parser.add_argument('--augment', action='store_true', help='augmented inference')

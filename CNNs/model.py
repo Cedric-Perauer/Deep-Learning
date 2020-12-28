@@ -127,7 +127,7 @@ class Model(pl.LightningModule):
         self.config()
         self.run_save()
         self.load_model()
-        self.wandb_logging()
+        #self.wandb_logging()
         self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
@@ -174,6 +174,7 @@ class Model(pl.LightningModule):
                 file.write(self.ckpt['training_results'])  # write results.txt
         # Epochs
         start_epoch = self.ckpt['epoch'] + 1
+        self.start_epoch = start_epoch 
         if self.opt.resume:
             assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
             shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
@@ -188,25 +189,17 @@ class Model(pl.LightningModule):
         
     def train_inits(self):     
         # Epochs
-        start_epoch = self.ckpt['epoch'] + 1
-        if self.opt.resume:
-            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
-            shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
-        if self.epochs < start_epoch:
-            logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (self.weights, ckpt['epoch'], self.epochs))
-            self.epochs += self.ckpt['epoch']  # finetune additional epochs
-
-        # Image sizes
-        self.gs = int(max(self.stride))  # grid size (max stride)
-        self.imgsz, self.imgsz_test = [check_img_size(x, self.gs) for x in self.opt.img_size]  # verify imgsz are gs-multiples
-        
         # Exponential moving average
         self.ema = ModelEMA(self.model) if self.rank in [-1, 0] else None
+        
+        # DDP mode
+        if self.opt.local_rank != -1:
+            self.model = DDP(self.model, device_ids=[self.opt.local_rank], output_device=self.opt.local_rank)
+
 
         # Process 0
         if self.rank in [-1, 0]:
-            self.ema.updates = start_epoch * self.nb // self.accumulate  # set EMA updates
+            self.ema.updates = self.start_epoch * self.nb // self.accumulate  # set EMA updates
 
             if not self.opt.resume:
                 labels = np.concatenate(self.dataset.labels, 0)
@@ -424,6 +417,7 @@ class Model(pl.LightningModule):
 
 
     def training_step(self,batch,batch_idx):
+            print("Training Step") 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
             imgs = imgs.float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0

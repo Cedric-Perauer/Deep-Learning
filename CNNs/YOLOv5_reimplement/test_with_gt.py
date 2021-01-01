@@ -11,10 +11,10 @@ import yaml
 from tqdm import tqdm
 
 from models.experimental import attempt_load
-from utils.datasets import create_dataloader
+from utils.datasets_test import create_dataloader
 from utils.general import (
     coco80_to_coco91_class, check_dataset, check_file, check_img_size, compute_loss, non_max_suppression, scale_coords,
-    xyxy2xywh,plot_one_box, clip_coords,plot_single_images_with_gt,plot_images_with_gt,plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
+    xyxy2xywh,plot_one_box,plot_one_box_notxt, clip_coords,plot_single_images_with_gt,plot_images_with_gt,plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
 from utils.torch_utils import select_device, time_synchronized
 from utils.datasets import LoadStreams, LoadImages
 import random 
@@ -55,6 +55,7 @@ class Metrics():
 
     def metrics_compute(self,plots,*args):
         self.stats = [np.concatenate(x, 0) for x in zip(*self.stats)]  # to numpy
+
         if len(self.stats) and self.stats[0].any():
             p, r, ap, f1, ap_class = ap_per_class(*self.stats, plot=plots, fname=self.save_dir / 'precision-recall_curve.png')
             p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
@@ -84,7 +85,7 @@ class Metrics():
 
 class Test(Metrics):
     def __init__(self,data,weights=None,batch_size=16,
-            img_size=640,conf_thresh=0.001,iou_thresh=0.6,single_cls=False,
+            img_size=640,conf_thresh=0.25,iou_thresh=0.5,single_cls=False,
             augment=False,verbose=True,model=None,dataloader=None,
             save_dir=Path(''),save_txt=False,save_conf=False,plots=True):
         
@@ -109,7 +110,8 @@ class Test(Metrics):
         self.paths = None 
         self.im = None 
         self.tags = None
-        self.tag_mode = True
+        self.tag_mode = False
+        self.cuda_preds = None  
 
     def track_data(self):     
         set_logging()
@@ -166,11 +168,11 @@ class Test(Metrics):
         return img 
 
     def batch_compute(self,*args):
-        img,targets,self.paths,shapes, self.tags = args[0] #data
+        img,targets,self.paths,shapes, self.cuda_preds = args[0] #data
         self.img = self.img_preprocess(img)
         self.targets = targets.to(self.device) 
         _ , _, self.h,self.w = self.img.shape #order is batch size,channels (already known from init and image), height,width 
-        
+
 
         with torch.no_grad(): 
             #model 
@@ -182,8 +184,73 @@ class Test(Metrics):
             t = time_synchronized()
             output = non_max_suppression(inf_out,conf_thres=self.conf_thresh,iou_thres=self.iou_thresh)
             self.t_nms += time_synchronized() - t
-            #self.compute_stats(output) 
-            self.compute_stats_tags(output) 
+            self.compute_stats_cuda(output) 
+            #self.compute_stats_tags(output) 
+    
+    def output_process(self,output):
+        base = os.path.expanduser("~/Learning_Cuda/tensorrt/yolov5/labels_pred/") 
+        imgs = os.path.expanduser("~/CATKIN_FS/src/02_perception/camera/training/object_detection/fsd_dataset/images/" + opt.task +"/") 
+        preds = []
+        preds2 = []
+
+        for path in self.paths :
+               arr_split = path.split('/')[-1]
+               f_name = arr_split.split('.')[0]
+               img_orig = cv2.imread(imgs + f_name + '.jpg')
+               orig_h , orig_w, _ = img_orig.shape
+               h_factor = orig_h / self.h
+               w_factor = orig_w / self.w
+               img = self.img[0,:,:,:]
+               img = img.transpose(0,2) 
+               img = img.transpose(0,1)
+               img = img.cpu().numpy().astype(np.float32) * 255 
+               
+               h_offset = 0 
+               w_offset = 0
+               start = img[0,0,:]
+               for i in range(0,100): 
+                   if np.all(img[i,self.w//2,:] == start):
+                        h_offset += 1
+               
+               print(start)
+               for j in range(0,100):
+                   if np.all(img[self.h//2,j,:] == start):
+                       w_offset += 1
+               
+               w_offset, h_offset = 0,0
+
+               
+               img = cv2.UMat(img)
+                 
+               label_file = os.path.join(base,f_name +".txt")  
+               arr = []
+               arr2 = []
+               with open(label_file,"r") as f :
+                    content = f.readlines()
+
+                    for line in content :
+                        line = line.split(" ") 
+                        a  = [float(line[0]) / w_factor,float(line[1]) / h_factor,float(line[2]) / w_factor,float(line[3]) / h_factor, float(line[4]),float(line[5])]
+                        pt1 =  (int(float(line[0]) / w_factor) + w_offset, -h_offset + int(float(line[1]) / h_factor))
+                        pt2 = (int(float(line[2]) / w_factor) + w_offset,int(float(line[3]) / h_factor) - h_offset)
+                        img = cv2.rectangle(img,pt1,pt2,(255,255,255),2) 
+                        b  = [float(line[0]) ,float(line[1]) ,float(line[2]) ,float(line[3]) , float(line[4]),float(line[5])]
+                        
+                        arr.append(a)  
+                        arr2.append(b) 
+                    cv2.imwrite("img.jpg",img)
+                    num = np.asarray(arr)
+                    num2 = np.asarray(arr2)
+                    targe = torch.from_numpy(num).to(self.device).float()
+                    targe2 = torch.from_numpy(num2).to(self.device).float()
+
+                    preds.append(targe)
+                    preds2.append(targe2)
+        self.cuda_preds = preds2
+        return preds
+
+
+
 
     def plot_images(self):
         f = self.save_dir / f'test_batch_compare_{self.batch_idx}.jpg'
@@ -218,7 +285,7 @@ class Test(Metrics):
                         for *xyxy, conf, cls in reversed(det):
                                 label = '%s %.2f' % (self.names[int(cls)], conf)
                                 if conf > self.conf_thresh : 
-                                    im0 = plot_one_box(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
+                                    im0 = plot_one_box_notxt(xyxy, im0, label=label, color=colors[int(cls)], line_thickness=3)
                 label_file = p.split("/")
                 img_name = label_file[-1]
                 label_file[-3],label_file[-1] = "labels", label_file[-1][:-3] + "txt"
@@ -236,7 +303,9 @@ class Test(Metrics):
                         tl = (tl_x,tl_y) 
                         br = (br_x,br_y) 
 
-                        im0 = cv2.rectangle(im0,tl,br,(0,200,0),5)
+                        im0 = cv2.rectangle(im0,tl,br,(0,200,0),1)
+            cv2.imshow("out",im0)
+            cv2.waitKey(0)
             cv2.imwrite("runs/test/compare/" + img_name ,im0)     
 
     def compute_stats_tags(self,output):
@@ -274,11 +343,11 @@ class Test(Metrics):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
                     pi = (pred[:, 5] != 10).nonzero(as_tuple=False).view(-1)  # target indices
                     # Search for detections
-
                     if pi.shape[0]:
                         ious, i = box_iou(tbox[ti],pred[pi, :4]).max(1)  # best ious, indices
                         # Prediction to target ious
-                        for iou in ious : 
+                        for iou in ious :
+                            print(cls)
                             self.tags_ious[int(cls.item())].append(iou.item())
             c += 1 
             # Append statistics (correct, conf, pcls, tcls)
@@ -328,7 +397,6 @@ class Test(Metrics):
 
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5]) * whwh
-                
                 # Per target class
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
@@ -352,16 +420,72 @@ class Test(Metrics):
             # Append statistics (correct, conf, pcls, tcls)
             self.stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
             #if self.plots : 
-                #self.plot_images()
+            #self.plot_images()
+
+    def compute_stats_cuda(self,output):
+        whwh = torch.Tensor([self.w,self.h,self.w,self.h]).to(device = self.device) 
+        for si, pred in enumerate(output):
+            labels = self.targets[self.targets[:,0] == si,1:] #label for corresponding index 
+            cuda_preds = self.cuda_preds[self.cuda_preds[:,0] == si,1:]
+            cuda_preds = cuda_preds.to(self.device)
+            nl = len(labels) 
+            tcls = labels[:,0].tolist() if nl else []
+
+            self.seen += 1 
+            
+            if cuda_preds is None : 
+                if nl : 
+                    self.stats.append((torch.zeros(0,self.niou,dtype=torch.bool),torch.Tensor(),torch.Tensor(),tcls))
+                continue
+
+            
+
+            # Assign all predictions as incorrect
+            correct = torch.zeros(cuda_preds.shape[0], self.niou, dtype=torch.bool, device=self.device)
+            if nl:
+                detected = []  # target indices
+                tcls_tensor = labels[:, 0]
+
+                # target boxes
+                pred = torch.zeros((cuda_preds.shape[0],6),device=self.device)
+                tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+                pred[:,:4] = xywh2xyxy(cuda_preds[:, 1:5]) * whwh
+                pred[:,4] = 1
+                pred[:,5] = cuda_preds[:,0] 
+                # Per target class
+                for cls in torch.unique(tcls_tensor):
+                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+                    # Search for detections
+                    if pi.shape[0]:
+                        # Prediction to target ious
+                        ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+                        # Append detections
+                        ind = i 
+                        detected_set = set()
+                        for j in (ious > self.iouv[0]).nonzero(as_tuple=False):
+                             
+                            d = ti[ind[j]]  # detected target
+                            if d.item() not in detected_set:
+                                detected_set.add(d.item())
+                                detected.append(d)
+                                correct[pi[j]] = ious[j] > self.iouv  # iou_thres is 1xn
+                                if len(detected) == nl:  # all targets already located in image
+                                    break
+            # Append statistics (correct, conf, pcls, tcls)
+            self.stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            #if self.plots : 
+            #self.plot_images()    
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(prog='test.py')
-    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')
+    parser.add_argument('--weights', nargs='+', type=str, default='best_small.pt', help='model.pt path(s)')
     parser.add_argument('--data', type=str, default='data/fsd.yaml', help='*.data path')
     parser.add_argument('--batch-size', type=int, default=32, help='size of each image batch')
     parser.add_argument('--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='object confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.65, help='IOU threshold for NMS')
+    parser.add_argument('--iou-thres', type=float, default=0.5, help='IOU threshold for NMS')
     parser.add_argument('--save-json', action='store_true', help='save a cocoapi-compatible JSON results file')
     parser.add_argument('--task', default='test', help="'val', 'test', 'study'")
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')

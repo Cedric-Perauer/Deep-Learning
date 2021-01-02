@@ -121,13 +121,13 @@ class Model(pl.LightningModule):
             self.stride = m.stride
             self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
-      
+
         initialize_weights(self)
         self.info()
         self.config()
         self.run_save()
         self.load_model()
-        self.wandb_logging()
+        #self.wandb_logging()
         self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
@@ -174,6 +174,7 @@ class Model(pl.LightningModule):
                 file.write(self.ckpt['training_results'])  # write results.txt
         # Epochs
         start_epoch = self.ckpt['epoch'] + 1
+        self.start_epoch = start_epoch 
         if self.opt.resume:
             assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
             shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
@@ -188,25 +189,17 @@ class Model(pl.LightningModule):
         
     def train_inits(self):     
         # Epochs
-        start_epoch = self.ckpt['epoch'] + 1
-        if self.opt.resume:
-            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
-            shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
-        if self.epochs < start_epoch:
-            logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (self.weights, ckpt['epoch'], self.epochs))
-            self.epochs += self.ckpt['epoch']  # finetune additional epochs
-
-        # Image sizes
-        self.gs = int(max(self.stride))  # grid size (max stride)
-        self.imgsz, self.imgsz_test = [check_img_size(x, self.gs) for x in self.opt.img_size]  # verify imgsz are gs-multiples
-        
         # Exponential moving average
         self.ema = ModelEMA(self.model) if self.rank in [-1, 0] else None
+        
+        # DDP mode
+        if self.opt.local_rank != -1:
+            self.model = DDP(self.model, device_ids=[self.opt.local_rank], output_device=self.opt.local_rank)
+
 
         # Process 0
         if self.rank in [-1, 0]:
-            self.ema.updates = start_epoch * self.nb // self.accumulate  # set EMA updates
+            self.ema.updates = self.start_epoch * self.nb // self.accumulate  # set EMA updates
 
             if not self.opt.resume:
                 labels = np.concatenate(self.dataset.labels, 0)
@@ -238,20 +231,25 @@ class Model(pl.LightningModule):
         self.scaler = amp.GradScaler(enabled=self.cuda)
 
 
-
+    def intersect_dicts(self,da, db, exclude=()):
+        # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
+        import pdb; pdb.set_trace()
+        return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}
         
 
 
     def load_model(self): 
         # Model
+        print("Loading model") 
+        import pdb; pdb.set_trace()
         self.ckpt = torch.load(self.weights)  # load checkpoint
         if self.hyp.get('anchors'):
             self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
-        exclude = ['anchor'] if opt.cfg or self.hyp.get('anchors') else []  # exclude keys
-        self.state_dict_model = self.ckpt['model'].float().state_dict()  # to FP32
-        self.state_dict_model = intersect_dicts(self.state_dict_model, self.model.state_dict(), exclude=exclude)  # intersect
-        self.model.load_state_dict(self.state_dict_model, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(self.state_dict_model), len(self.model.state_dict()), self.weights))  # report
+        exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
+        state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
+        state_dict =self. intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
+        self.model.load_state_dict(state_dict, strict=False)  # load
+        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(self.model.state_dict()), self.weights))  # report
         
         #freeeze paramaters 
         # Freeze
@@ -261,7 +259,7 @@ class Model(pl.LightningModule):
             if any(x in k for x in freeze):
                 print('freezing %s' % k)
                 v.requires_grad = False
-
+        import pdb; pdb.set_trace()
 
     def wandb_logging(self): 
         if wandb and wandb.run is None:
@@ -287,6 +285,7 @@ class Model(pl.LightningModule):
                 y.append(yi)
             return torch.cat(y, 1), None  # augmented inference, train
         else:
+            
             return self.forward_once(x, profile)  # single-scale inference, train
 
     def forward_once(self, x, profile=False):
@@ -312,6 +311,7 @@ class Model(pl.LightningModule):
 
         if profile:
             print('%.1fms total' % sum(dt))
+        
         return x
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
@@ -424,6 +424,7 @@ class Model(pl.LightningModule):
 
 
     def training_step(self,batch,batch_idx):
+            print("Training Step") 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
             imgs = imgs.float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0

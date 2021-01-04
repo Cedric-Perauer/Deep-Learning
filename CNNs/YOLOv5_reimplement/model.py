@@ -187,7 +187,10 @@ class Model(pl.LightningModule):
         self.gs = int(max(self.stride))  # grid size (max stride)
         self.imgsz, self.imgsz_test = [check_img_size(x, self.gs) for x in self.opt.img_size]  # verify imgsz are gs-multiples
         
+
+
     def train_inits(self):     
+        self.batch_count = 0 
         # Epochs
         # Exponential moving average
         self.ema = ModelEMA(self.model) if self.rank in [-1, 0] else None
@@ -228,12 +231,11 @@ class Model(pl.LightningModule):
                 'Starting training for %g epochs...' % (self.imgsz, self.imgsz_test, self.train_dataloader.num_workers, self.log_dir, self.epochs))
      
         self.cuda = device.type != 'cpu' 
-        self.scaler = amp.GradScaler(enabled=self.cuda)
+        #self.scaler = amp.GradScaler(enabled=self.cuda)
 
 
     def intersect_dicts(self,da, db, exclude=()):
         # Dictionary intersection of matching keys and shapes, omitting 'exclude' keys, using da values
-        import pdb; pdb.set_trace()
         return {k: v for k, v in da.items() if k in db and not any(x in k for x in exclude) and v.shape == db[k].shape}
         
 
@@ -241,16 +243,15 @@ class Model(pl.LightningModule):
     def load_model(self): 
         # Model
         print("Loading model") 
-        import pdb; pdb.set_trace()
         self.ckpt = torch.load(self.weights)  # load checkpoint
         if self.hyp.get('anchors'):
             self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
         exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
         state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
-        state_dict =self. intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
+        #state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
         self.model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(self.model.state_dict()), self.weights))  # report
-        
+        del state_dict 
         #freeeze paramaters 
         # Freeze
         freeze = []  # parameter names to freeze (full or partial)
@@ -259,7 +260,7 @@ class Model(pl.LightningModule):
             if any(x in k for x in freeze):
                 print('freezing %s' % k)
                 v.requires_grad = False
-        import pdb; pdb.set_trace()
+
 
     def wandb_logging(self): 
         if wandb and wandb.run is None:
@@ -268,6 +269,7 @@ class Model(pl.LightningModule):
         
 
     def forward(self, x, augment=False, profile=False):
+        
         if augment:
             img_size = x.shape[-2:]  # height, width
             s = [1, 0.83, 0.67]  # scales
@@ -289,6 +291,7 @@ class Model(pl.LightningModule):
             return self.forward_once(x, profile)  # single-scale inference, train
 
     def forward_once(self, x, profile=False):
+        
         y, dt = [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -307,7 +310,7 @@ class Model(pl.LightningModule):
                 print('%10.1f%10.0f%10.1fms %-40s' % (o, m.np, dt[-1], m.type))
 
             x = m(x)  # run
-            y.append(x if m.i in self.save else None)  # save output
+            y.append(x) # save output
 
         if profile:
             print('%.1fms total' % sum(dt))
@@ -363,6 +366,17 @@ class Model(pl.LightningModule):
 
     def info(self, verbose=False):  # print model information
         model_info(self, verbose)
+    
+    def hyp(self): 
+        # Hyperparameters
+        hyp_path = "data/hyp.scratch.yaml"
+        with open(opt.hyp) as f:
+            self.hyp = yaml.load(f, Loader=yaml.FullLoader)  # load hyps
+            if 'box' not in hyp:
+                warn('Compatibility: %s missing "box" which was renamed from "giou" in %s' %
+                     (hyp_path, 'https://github.com/ultralytics/yolov5/pull/1120'))
+         
+
 
     def train_dataloader(self):
         
@@ -375,22 +389,16 @@ class Model(pl.LightningModule):
         self.train_inits()
         return self.train_dataloader
        
-    def hyp(self): 
-        # Hyperparameters
-        hyp_path = "data/hyp.scratch.yaml"
-        with open(opt.hyp) as f:
-            self.hyp = yaml.load(f, Loader=yaml.FullLoader)  # load hyps
-            if 'box' not in hyp:
-                warn('Compatibility: %s missing "box" which was renamed from "giou" in %s' %
-                     (hyp_path, 'https://github.com/ultralytics/yolov5/pull/1120'))
-         
-
     def val_dataloader(self):
         pass
         
     def test_dataloader(self):
-        pass 
+        self.test_dataloader = create_dataloader(self.test_path, self.imgsz_test, self.total_batch_size, self.gs, self.opt,
+                                       hyp=self.hyp, augment=False, cache=self.opt.cache_images and not self.opt.notest, rect=True,
+                                       rank=-1, world_size=self.opt.world_size, workers=self.opt.workers)[0]  # testloader
 
+        return self.test_dataloader
+    
     def configure_optimizers(self):
         # Optimizer
         self.nbs = 64  # nominal batch size
@@ -398,14 +406,13 @@ class Model(pl.LightningModule):
         self.hyp['weight_decay'] *= self.total_batch_size * self.accumulate / self.nbs  # scale weight_decay
 
         pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-        for k, v in self.named_modules():
+        for k, v in self.model.named_modules():
             if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
                 pg2.append(v.bias)  # biases
             if isinstance(v, nn.BatchNorm2d):
                 pg0.append(v.weight)  # no decay
             elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
                 pg1.append(v.weight)  # apply decay
-
         if self.opt.adam:
             optimizer = optim.Adam(pg0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
         else:
@@ -420,14 +427,18 @@ class Model(pl.LightningModule):
 
         return [optimizer],[scheduler]
     
-
+    
 
 
     def training_step(self,batch,batch_idx):
-            print("Training Step") 
+            
+            import pdb; pdb.set_trace()  
+            print("Training Step")
+            self.batch_count = 0 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
             imgs = imgs.float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
+            self.mloss = torch.zeros(4,device=imgs.device) 
 
             # Warmup
             if ni <= self.nw:
@@ -450,18 +461,22 @@ class Model(pl.LightningModule):
             
             # Forward
             with amp.autocast(enabled=self.cuda):
+                
                 pred = self.forward(imgs)  # forward
-                import pdb; pdb.set_trace()
-                loss, loss_items = compute_loss(pred, targets, self)  # loss scaled by batch_size
-                if rank != -1:
-                    loss *= self.world_size  # gradient averaged between devices in DDP mode
+                loss, loss_items = compute_loss(pred, targets, self.model)  # loss scaled by batch_size
+                import pdb; pdb.set_trace()  
+                if self.rank != -1:
+                    loss *= self.opt.world_size  # gradient averaged between devices in DDP mode
+            
             # Backward
-            self.scaler.scale(loss).backward()
+            #loss.backward()
 
             # Optimize
             if ni % self.accumulate == 0:
-                self.scaler.step(self.optimizer)  # optimizer.step
-                self.scaler.update()
+                #self.scaler.step(self.optimizer)  # optimizer.step
+                self.optimizer.step()
+                #self.optimizer.zero_grad()
+                #self.scaler.update()
                 self.optimizer.zero_grad()
                 if self.ema:
                     # Optimize
@@ -469,21 +484,85 @@ class Model(pl.LightningModule):
 
             # Print
             if self.rank in [-1, 0]:
-                mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                self.mloss = (self.mloss * self.batch_count + loss_items) / (self.batch_count + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
-                    '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
-                pbar.set_description(s)
-
+                    '%g/%g' % (self.current_epoch, self.epochs - 1), mem, *self.mloss, targets.shape[0], imgs.shape[-1])
+                print("----------------------------") 
+                print("Mloss is : ",*self.mloss)
                 # Plot
                 if ni < 3:
-                    f = str(log_dir / f'train_batch{ni}.jpg')  # filename
+                    f = str(self.log_dir / f'train_batch{ni}.jpg')  # filename
                     result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
                     # if tb_writer and result is not None:
                     # tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     # tb_writer.add_graph(model, imgs)  # add model to tensorboard
             # end batch ------------------------------------------------------------------------------------------------
-             
+            
+            import pdb; pdb.set_trace()  
+            del imgs, targets, paths, loss, loss_items, pred, result 
+
+    def on_epoch_end(self): 
+                print("epoch end") 
+                # Scheduler
+                lr = [x['lr'] for x in self.optimizer.param_groups]  # for tensorboard
+                self.lr_scheduler.step()
+                
+                results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+                # DDP process 0 or single-GPU
+                if self.rank in [-1, 0]:
+                    # mAP
+                    if self.ema:
+                        ema.update_attr(self.model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
+                    final_epoch = self.current_epoch + 1 == self.epochs
+                    if not opt.notest or final_epoch:  # Calculate mAP
+                     results, maps, times = test.test(self.opt.data,
+                                                 batch_size=self.total_batch_size,
+                                                 imgsz=self.imgsz_test,
+                                                 model=self.ema.ema,
+                                                 single_cls=self.opt.single_cls,
+                                                 dataloader=self.test_dataloader,
+                                                 save_dir=self.log_dir,
+                                                 plots=self.current_epoch == 0 or self.final_epoch)
+
+                          # Write
+                    with open(self.results_file, 'a') as f:
+                        f.write(s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+                    if len(opt.name) and opt.bucket:
+                        os.system('gsutil cp %s gs://%s/results/results%s.txt' % (self.results_file, self.opt.bucket, self.opt.name))
+
+                    # Log
+                    tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
+                            'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
+                            'val/giou_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
+                            'x/lr0', 'x/lr1', 'x/lr2']  # params
+                    for x, tag in zip(list(self.mloss[:-1]) + list(results) + lr, tags):
+                        if tb_writer:
+                            tb_writer.add_scalar(tag, x, epoch)  # tensorboard
+                        if wandb:
+                            wandb.log({tag: x})  # W&B
+
+                    # Update best mAP
+                    fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
+                    if fi > best_fitness:
+                        best_fitness = fi
+
+                    # Save model
+                    save = (not opt.nosave) or (final_epoch and not opt.evolve)
+                    if save:
+                        with open(results_file, 'r') as f:  # create checkpoint
+                            ckpt = {'epoch': epoch,
+                                    'best_fitness': best_fitness,
+                                    'training_results': f.read(),
+                                    'model': ema.ema,
+                                    'optimizer': None if final_epoch else optimizer.state_dict(),
+                                    'wandb_id': wandb_run.id if wandb else None}
+
+                        # Save last, best and delete
+                        torch.save(ckpt, last)
+                        if best_fitness == fi:
+                            torch.save(ckpt, best)
+                        del ckpt
 
 
 
@@ -629,5 +708,5 @@ if __name__ == '__main__':
      
 
     model = Model(opt,hyp,opt.cfg)
-    trainer = pl.Trainer(fast_dev_run=True) 
+    trainer = pl.Trainer(gpus=1) 
     trainer.fit(model)

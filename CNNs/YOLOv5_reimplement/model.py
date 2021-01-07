@@ -20,6 +20,7 @@ import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
 import torch.utils.data
 
+import test
 from models.common import Conv, Bottleneck, SPP, DWConv, Focus, BottleneckCSP, Concat, NMS, autoShape
 from models.experimental import MixConv2d, CrossConv, C3
 from utils.general import check_anchor_order, make_divisible, check_file, set_logging
@@ -32,6 +33,9 @@ from utils.general import (
     torch_distributed_zero_first, labels_to_class_weights, plot_labels, check_anchors, labels_to_image_weights,
     compute_loss, plot_images, fitness, strip_optimizer, plot_results, get_latest_run, check_dataset, check_file,
     check_git_status, check_img_size, increment_dir, print_mutation, plot_evolution, set_logging, init_seeds)
+
+
+
 from utils.google_utils import attempt_download
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts
 from torch.cuda import amp
@@ -39,6 +43,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+#Solely for Test
+from models.experimental import attempt_load
+from utils.datasets import create_dataloader
+from utils.general import (
+    coco80_to_coco91_class, check_dataset, check_file, check_img_size, compute_loss, non_max_suppression, scale_coords,
+    xyxy2xywh, clip_coords, plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
+from utils.torch_utils import select_device, time_synchronized
 
 class Detect(nn.Module):
     stride = None  # strides computed during build
@@ -387,18 +398,21 @@ class Model(pl.LightningModule):
 
         assert mlc < self.nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
         self.train_inits()
+        
+        self.test_dataloader = create_dataloader(self.test_path, self.imgsz_test, self.total_batch_size, self.gs, self.opt,
+                                       hyp=self.hyp, augment=False, cache=self.opt.cache_images and not self.opt.notest, rect=True,
+                                       rank=-1, world_size=self.opt.world_size, workers=self.opt.workers)[0]  # testloader
+
+
+
         return self.train_dataloader
        
     def val_dataloader(self):
         pass
         
     def test_dataloader(self):
-        self.test_dataloader = create_dataloader(self.test_path, self.imgsz_test, self.total_batch_size, self.gs, self.opt,
-                                       hyp=self.hyp, augment=False, cache=self.opt.cache_images and not self.opt.notest, rect=True,
-                                       rank=-1, world_size=self.opt.world_size, workers=self.opt.workers)[0]  # testloader
+        pass 
 
-        return self.test_dataloader
-    
     def configure_optimizers(self):
         # Optimizer
         self.nbs = 64  # nominal batch size
@@ -432,7 +446,6 @@ class Model(pl.LightningModule):
 
     def training_step(self,batch,batch_idx):
             
-            import pdb; pdb.set_trace()  
             print("Training Step")
             self.batch_count = 0 
             imgs, targets, paths, _ = batch
@@ -462,14 +475,16 @@ class Model(pl.LightningModule):
             # Forward
             with amp.autocast(enabled=self.cuda):
                 
+
                 pred = self.forward(imgs)  # forward
+                import pdb; pdb.set_trace()
                 loss, loss_items = compute_loss(pred, targets, self.model)  # loss scaled by batch_size
-                import pdb; pdb.set_trace()  
+                
                 if self.rank != -1:
                     loss *= self.opt.world_size  # gradient averaged between devices in DDP mode
             
             # Backward
-            #loss.backward()
+            loss.backward()
 
             # Optimize
             if ni % self.accumulate == 0:
@@ -478,15 +493,15 @@ class Model(pl.LightningModule):
                 #self.optimizer.zero_grad()
                 #self.scaler.update()
                 self.optimizer.zero_grad()
-                if self.ema:
+                #if self.ema:
                     # Optimize
-                    self.ema.update(self.model)
+                #    self.ema.update(self.model)
 
             # Print
             if self.rank in [-1, 0]:
                 self.mloss = (self.mloss * self.batch_count + loss_items) / (self.batch_count + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
-                s = ('%10s' * 2 + '%10.4g' * 6) % (
+                self.s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (self.current_epoch, self.epochs - 1), mem, *self.mloss, targets.shape[0], imgs.shape[-1])
                 print("----------------------------") 
                 print("Mloss is : ",*self.mloss)
@@ -499,8 +514,6 @@ class Model(pl.LightningModule):
                     # tb_writer.add_graph(model, imgs)  # add model to tensorboard
             # end batch ------------------------------------------------------------------------------------------------
             
-            import pdb; pdb.set_trace()  
-            del imgs, targets, paths, loss, loss_items, pred, result 
 
     def on_epoch_end(self): 
                 print("epoch end") 
@@ -512,23 +525,17 @@ class Model(pl.LightningModule):
                 # DDP process 0 or single-GPU
                 if self.rank in [-1, 0]:
                     # mAP
-                    if self.ema:
-                        ema.update_attr(self.model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
+                    #if self.ema:
+                    #    ema.update_attr(self.model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
                     final_epoch = self.current_epoch + 1 == self.epochs
-                    if not opt.notest or final_epoch:  # Calculate mAP
-                     results, maps, times = test.test(self.opt.data,
-                                                 batch_size=self.total_batch_size,
-                                                 imgsz=self.imgsz_test,
-                                                 model=self.ema.ema,
-                                                 single_cls=self.opt.single_cls,
-                                                 dataloader=self.test_dataloader,
-                                                 save_dir=self.log_dir,
-                                                 plots=self.current_epoch == 0 or self.final_epoch)
+                    if not self.opt.notest or final_epoch:  # Calculate mAP
+                    #Test function
+                         self.test()
 
                           # Write
                     with open(self.results_file, 'a') as f:
-                        f.write(s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
-                    if len(opt.name) and opt.bucket:
+                        f.write(self.s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+                    if len(self.opt.name) and self.opt.bucket:
                         os.system('gsutil cp %s gs://%s/results/results%s.txt' % (self.results_file, self.opt.bucket, self.opt.name))
 
                     # Log
@@ -537,33 +544,233 @@ class Model(pl.LightningModule):
                             'val/giou_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
                             'x/lr0', 'x/lr1', 'x/lr2']  # params
                     for x, tag in zip(list(self.mloss[:-1]) + list(results) + lr, tags):
-                        if tb_writer:
-                            tb_writer.add_scalar(tag, x, epoch)  # tensorboard
-                        if wandb:
-                            wandb.log({tag: x})  # W&B
+                        if self.tb_writer:
+                            self.tb_writer.add_scalar(tag, x, self.current_epoch)  # tensorboard
+                        #if wandb:
+                            #wandb.log({tag: x})  # W&B
 
                     # Update best mAP
                     fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-                    if fi > best_fitness:
-                        best_fitness = fi
+                    if fi > self.best_fitness:
+                        self.best_fitness = fi
 
                     # Save model
-                    save = (not opt.nosave) or (final_epoch and not opt.evolve)
+                    save = (not self.opt.nosave) or (final_epoch and not self.opt.evolve)
                     if save:
-                        with open(results_file, 'r') as f:  # create checkpoint
-                            ckpt = {'epoch': epoch,
-                                    'best_fitness': best_fitness,
+                        with open(self.results_file, 'r') as f:  # create checkpoint
+                            ckpt = {'epoch': self.current_epoch,
+                                    'best_fitness': self.best_fitness,
                                     'training_results': f.read(),
-                                    'model': ema.ema,
-                                    'optimizer': None if final_epoch else optimizer.state_dict(),
-                                    'wandb_id': wandb_run.id if wandb else None}
+                                    'model': self.model,
+                                    'optimizer': None if final_epoch else self.optimizer.state_dict(),
+                                    'wandb_id': None}
 
                         # Save last, best and delete
-                        torch.save(ckpt, last)
-                        if best_fitness == fi:
-                            torch.save(ckpt, best)
+                        torch.save(ckpt, self.last)
+                        if self.best_fitness == fi:
+                            torch.save(ckpt, self.best)
                         del ckpt
 
+##################################### TESTING #################################
+    def test(self,
+             weights=None,
+             batch_size=16,
+             imgsz=640,
+             conf_thres=0.25,
+             iou_thres=0.5,  # for NMS
+             save_json=False,
+             single_cls=False,
+             augment=False,
+             verbose=False,
+             model=None,
+             dataloader=None,
+             save_dir=Path(''),  # for saving images
+             save_txt=False,  # for auto-labelling
+             save_conf=False,
+             plots=True):
+        # Initialize/load model and set device
+        losses = {} #keep track of images with worst mAP
+        training = True 
+        data = self.opt.data
+
+        print("IOU Threshold", iou_thres)
+        print("Conf Threshold", conf_thres)
+        if training:  # called by train.py
+            device = next(self.model.parameters()).device  # get model device
+        
+        """
+        else:  # called directly
+            set_logging()
+            device = self.model.device #get model device  
+            save_txt = self.opt.save_txt  # save *.txt labels
+
+            # Remove previous
+            if os.path.exists(save_dir):
+                shutil.rmtree(save_dir)  # delete dir
+            os.makedirs(save_dir)  # make new dir
+
+            if self.save_txt:
+                out = self.save_dir / 'autolabels'
+                if os.path.exists(out):
+                    shutil.rmtree(out)  # delete dir
+                os.makedirs(out)  # make new dir
+
+            # Load model
+            imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
+
+            # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
+            # if device.type != 'cpu' and torch.cuda.device_count() > 1:
+            #     model = nn.DataParallel(model)
+        """
+        # Half
+        half = device.type != 'cpu'  # half precision only supported on CUDA
+        if half:
+            self.model.half()
+
+        # Configure
+        self.model.eval()
+        with open(data) as f:
+            data = yaml.load(f, Loader=yaml.FullLoader)  # model dict
+        check_dataset(data)  # check
+        nc = 1 if self.opt.single_cls else int(data['nc'])  # number of classes
+        iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
+        niou = iouv.numel()
+
+        seen = 0
+        names = self.model.names if hasattr(self.model, 'names') else self.model.module.names
+        coco91class = coco80_to_coco91_class()
+        s = ('%20s' + '%12s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@.5', 'mAP@.5:.95')
+        p, r, f1, mp, mr, map50, map, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+        loss = torch.zeros(3, device=device)
+        jdict, stats, ap, ap_class = [], [], [], []
+        for batch_i, (img, targets, paths, shapes ) in enumerate(tqdm(self.test_dataloader, desc=s)):
+            
+         
+            img = img.to(device, non_blocking=True)
+            img = img.half() if half else img.float()  # uint8 to fp16/32
+            img /= 255.0  # 0 - 255 to 0.0 - 1.0
+            targets = targets.to(device)
+            nb, _, height, width = img.shape  # batch size, channels, height, width
+            whwh = torch.Tensor([width, height, width, height]).to(device)
+
+            # Disable gradients
+            with torch.no_grad():
+                # Run model
+                t = time_synchronized()
+                inf_out, train_out = self.forward(img)  # inference and training outputs
+                t0 += time_synchronized() - t
+
+                # Compute loss
+                if training:  # if model has loss hyperparameters
+                    loss += compute_loss([x.float() for x in train_out], targets, self.model)[1][:3]  # box, obj, cls
+
+                # Run NMS
+                t = time_synchronized()
+                output = non_max_suppression(inf_out, conf_thres=conf_thres, iou_thres=iou_thres)
+                t1 += time_synchronized() - t
+            
+            # Statistics per image
+            print(paths[0]) 
+            for si, pred in enumerate(output):
+                labels = targets[targets[:, 0] == si, 1:]
+                nl = len(labels)
+                tcls = labels[:, 0].tolist() if nl else []  # target class
+                seen += 1
+
+                if pred is None:
+                    if nl:
+                        stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
+                    continue
+
+                # Append to text file
+                if save_txt:
+                    gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
+                    x = pred.clone()
+                    x[:, :4] = scale_coords(img[si].shape[1:], x[:, :4], shapes[si][0], shapes[si][1])  # to original
+                    for *xyxy, conf, cls in x:
+                        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                        line = (cls, conf, *xywh) if save_conf else (cls, *xywh)  # label format
+                        with open(str(out / Path(paths[si]).stem) + '.txt', 'a') as f:
+                            f.write(('%g ' * len(line) + '\n') % line)
+
+                # Clip boxes to image bounds
+                clip_coords(pred, (height, width))
+
+                # Append to pycocotools JSON dictionary
+                if save_json:
+                    # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
+                    image_id = Path(paths[si]).stem
+                    box = pred[:, :4].clone()  # xyxy
+                    scale_coords(img[si].shape[1:], box, shapes[si][0], shapes[si][1])  # to original shape
+                    box = xyxy2xywh(box)  # xywh
+                    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
+                    for p, b in zip(pred.tolist(), box.tolist()):
+                        jdict.append({'image_id': int(image_id) if image_id.isnumeric() else image_id,
+                                      'category_id': coco91class[int(p[5])],
+                                      'bbox': [round(x, 3) for x in b],
+                                      'score': round(p[4], 5)})
+
+                # Assign all predictions as incorrect
+                correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
+                if nl:
+                    detected = []  # target indices
+                    tcls_tensor = labels[:, 0]
+
+                    # target boxes
+                    tbox = xywh2xyxy(labels[:, 1:5]) * whwh
+
+                    # Per target class
+                    for cls in torch.unique(tcls_tensor):
+                        ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
+                        pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
+
+                        # Search for detections
+                        if pi.shape[0]:
+                            # Prediction to target ious
+                            ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
+
+                            # Append detections
+                            detected_set = set()
+                            for j in (ious > iouv[0]).nonzero(as_tuple=False):
+                                d = ti[i[j]]  # detected target
+                                if d.item() not in detected_set:
+                                    detected_set.add(d.item())
+                                    detected.append(d)
+                                    correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
+                                    if len(detected) == nl:  # all targets already located in image
+                                        break
+                
+                # Append statistics (correct, conf, pcls, tcls)
+                stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
+            # Plot images
+            if plots and batch_i < 1:
+                f = save_dir / f'test_batch{batch_i}_gt.jpg'  # filename
+                plot_images(img, targets, paths, str(f), names)  # ground truth
+                f = save_dir / f'test_batch{batch_i}_pred.jpg'
+                plot_images(img, output_to_target(output, width, height), paths, str(f), names)  # predictions
+        # Compute statistics
+        stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+        if len(stats) and stats[0].any():
+            p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, fname=save_dir / 'precision-recall_curve.png')
+            p, r, ap50, ap = p[:, 0], r[:, 0], ap[:, 0], ap.mean(1)  # [P, R, AP@0.5, AP@0.5:0.95]
+            mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
+            nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
+        else:
+            nt = torch.zeros(1)
+
+        # Print results
+        pf = '%20s' + '%12.3g' * 6  # print format
+        print(pf % ('all', seen, nt.sum(), mp, mr, map50, map))
+
+        # Print results per class
+        if verbose and nc > 1 and len(stats):
+            for i, c in enumerate(ap_class):
+                print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
+
+        # Print speeds
+        t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
+        if not training:
+            print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
@@ -708,5 +915,5 @@ if __name__ == '__main__':
      
 
     model = Model(opt,hyp,opt.cfg)
-    trainer = pl.Trainer(gpus=1) 
+    trainer = pl.Trainer(limit_train_batches=2, gpus=1) 
     trainer.fit(model)

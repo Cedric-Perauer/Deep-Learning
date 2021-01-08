@@ -60,7 +60,6 @@ def test(data,
             os.makedirs(out)  # make new dir
 
         # Load model
-        model = attempt_load(weights, map_location=device)  # load FP32 model
         imgsz = check_img_size(imgsz, s=model.stride.max())  # check img_size
 
         # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
@@ -110,7 +109,7 @@ def test(data,
         with torch.no_grad():
             # Run model
             t = time_synchronized()
-            inf_out, train_out = model(img, augment=augment)  # inference and training outputs
+            inf_out, train_out = model.forward(img)  # inference and training outputs
             t0 += time_synchronized() - t
 
             # Compute loss

@@ -55,7 +55,7 @@ class Detect(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
 
-    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=5, anchors=(), ch=()):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
@@ -110,6 +110,7 @@ class Model(pl.LightningModule):
         self.hyp = hyp  
         self.opt = opt
         self.tb_writer = tb_writer
+        self.ch = ch
         #init seeds
 
         init_seeds(2 + self.opt.global_rank)
@@ -143,7 +144,25 @@ class Model(pl.LightningModule):
         self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
     
+    def model_create(self): 
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
+        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+        
+        
 
+        # Build strides, anchors
+        m = self.model[-1]  # Detect()
+        if isinstance(m, Detect):
+            s = 128  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
+            m.anchors /= m.stride.view(-1, 1, 1)
+            check_anchor_order(m)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+            # print('Strides: %s' % m.stride.tolist())
+
+        initialize_weights(self)
+    
     def config(self):
         logger.info(f'Hyperparameters {hyp}')
         self.log_dir = Path(self.tb_writer.log_dir) if self.tb_writer else Path(self.opt.logdir) / 'evolve'  # logging directory
@@ -174,38 +193,73 @@ class Model(pl.LightningModule):
     def resume(self):
         # Resume
         self.start_epoch, self.best_fitness = 0, 0.0
-        # Optimizer
-        if self.ckpt['optimizer'] is not None:
-            self.optimizer.load_state_dict(self.ckpt['optimizer'])
-            best_fitness = self.ckpt['best_fitness']
+        if self.pretrained: 
+            # Optimizer
+            if self.ckpt['optimizer'] is not None:
+                self.optimizer.load_state_dict(self.ckpt['optimizer'])
+                best_fitness = self.ckpt['best_fitness']
 
-        # Results
-        if self.ckpt.get('training_results') is not None:
-            with open(self.results_file, 'w') as file:
-                file.write(self.ckpt['training_results'])  # write results.txt
-        # Epochs
-        start_epoch = self.ckpt['epoch'] + 1
-        self.start_epoch = start_epoch 
-        if self.opt.resume:
-            assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
-            shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
-        if self.epochs < start_epoch:
-            logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
-                        (self.weights, self.ckpt['epoch'], self.epochs))
-            self.epochs += self.ckpt['epoch']  # finetune additional epochs
+            # Results
+            if self.ckpt.get('training_results') is not None:
+                with open(self.results_file, 'w') as file:
+                    file.write(self.ckpt['training_results'])  # write results.txt
+            # Epochs
+            start_epoch = self.ckpt['epoch'] + 1
+            self.start_epoch = start_epoch 
+            if self.opt.resume:
+                assert start_epoch > 0, '%s training to %g epochs is finished, nothing to resume.' % (self.weights, self.epochs)
+                shutil.copytree(wdir, wdir.parent / f'weights_backup_epoch{start_epoch - 1}')  # save previous weights
+            if self.epochs < start_epoch:
+                logger.info('%s has been trained for %g epochs. Fine-tuning for %g additional epochs.' %
+                            (self.weights, self.ckpt['epoch'], self.epochs))
+                self.epochs += self.ckpt['epoch']  # finetune additional epochs
 
         # Image sizes
         self.gs = int(max(self.stride))  # grid size (max stride)
         self.imgsz, self.imgsz_test = [check_img_size(x, self.gs) for x in self.opt.img_size]  # verify imgsz are gs-multiples
-        
+    
+    def emaModel(self,decay=0.9999,updates=0): 
+        """ Model Exponential Moving Average from https://github.com/rwightman/pytorch-image-models
+        Keep a moving average of everything in the model state_dict (parameters and buffers).
+        This is intended to allow functionality like
+        https://www.tensorflow.org/api_docs/python/tf/train/ExponentialMovingAverage
+        A smoothed version of the weights is necessary for some training schemes to perform well.
+        This class is sensitive where it is initialized in the sequence of model init,
+        GPU assignment and distributed training wrappers.
+        """
+        ema = deepcopy(self.model.module if is_parallel(self.model) else self.model).eval()  # FP32 EMA
+        #if next(model.parameters()).device.type != 'cpu':
+             #ema.half()  # FP16 EMA
+        self.updates = updates  # number of EMA updates
+        decay = decay
+
+        self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
+        for p in ema.parameters():
+            p.requires_grad_(False)
+        import pdb;pdb.set_trace()
+        return ema
+
+    def ema_update(self):
+        with torch.no_grad():
+            self.updates += 1
+            d = self.decay(self.updates)
+            
+            import pdb;pdb.set_trace()
+            msd = self.model.module.state_dict() if is_parallel(self.model) else self.model.state_dict()  # model state_dict
+            for k, v in self.ema.state_dict().items():
+                if v.dtype.is_floating_point:
+                    v *= d
+                    v += (1. - d) * msd[k].detach()
+    
+    def ema_update_attr(self,include=(),exclude=("process_group","reducer")): 
+        copy_attr(self.ema, self.model, include, exclude) 
 
 
     def train_inits(self):     
         self.batch_count = 0 
         # Epochs
         # Exponential moving average
-        self.ema = ModelEMA(self.model) if self.rank in [-1, 0] else None
-        
+        self.ema = self.emaModel() if self.rank in [-1, 0] else None
         # DDP mode
         if self.opt.local_rank != -1:
             self.model = DDP(self.model, device_ids=[self.opt.local_rank], output_device=self.opt.local_rank)
@@ -224,7 +278,8 @@ class Model(pl.LightningModule):
                 if self.tb_writer:
                     # tb_writer.add_hparams(hyp, {})  # causes duplicate https://github.com/ultralytics/yolov5/pull/384
                     self.tb_writer.add_histogram('classes', c, 0)
-
+         
+        import pdb; pdb.set_trace() 
 
         # Model parameters
         self.hyp['cls'] *= self.nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
@@ -242,7 +297,7 @@ class Model(pl.LightningModule):
                 'Starting training for %g epochs...' % (self.imgsz, self.imgsz_test, self.train_dataloader.num_workers, self.log_dir, self.epochs))
      
         self.cuda = device.type != 'cpu' 
-        #self.scaler = amp.GradScaler(enabled=self.cuda)
+        self.scaler = amp.GradScaler(enabled=self.cuda)
 
 
     def intersect_dicts(self,da, db, exclude=()):
@@ -253,26 +308,45 @@ class Model(pl.LightningModule):
 
     def load_model(self): 
         # Model
-        print("Loading model") 
-        self.ckpt = torch.load(self.weights)  # load checkpoint
-        if self.hyp.get('anchors'):
-            self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
-        exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
-        state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
-        #state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
-        self.model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(self.model.state_dict()), self.weights))  # report
-        del state_dict 
-        #freeeze paramaters 
-        # Freeze
-        freeze = []  # parameter names to freeze (full or partial)
-        for k, v in self.named_parameters():
-            v.requires_grad = True  # train all layers
-            if any(x in k for x in freeze):
-                print('freezing %s' % k)
-                v.requires_grad = False
+        self.pretrained = True
+        if self.pretrained : 
+            print("Loading model") 
+            self.ckpt = torch.load(self.weights)  # load checkpoint
+            if self.hyp.get('anchors'):
+                self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
+            exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
+            state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
+            #state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
+            self.model.load_state_dict(state_dict, strict=False)  # load
+            logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(self.model.state_dict()), self.weights))  # report
+            del state_dict 
+            #freeeze paramaters 
+            # Freeze
+            freeze = []  # parameter names to freeze (full or partial)
+            for k, v in self.named_parameters():
+                v.requires_grad = True  # train all layers
+                if any(x in k for x in freeze):
+                    print('freezing %s' % k)
+                    v.requires_grad = False
+        else:
+            self.model, self.save = parse_model(deepcopy(self.yaml), ch=[self.ch])  # model, savelist, ch_out
+            # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+            
+            
 
+            # Build strides, anchors
+            m = self.model[-1]  # Detect()
+            if isinstance(m, Detect):
+                s = 128  # 2x min stride
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, self.ch, s, s))])  # forward
+                m.anchors /= m.stride.view(-1, 1, 1)
+                check_anchor_order(m)
+                self.stride = m.stride
+                self._initialize_biases()  # only run once
+                # print('Strides: %s' % m.stride.tolist())
 
+            initialize_weights(self)
+    
     def wandb_logging(self): 
         if wandb and wandb.run is None:
             id = self.ckpt.get('wandb_id') if 'ckpt' in locals() else None
@@ -477,25 +551,21 @@ class Model(pl.LightningModule):
                 
 
                 pred = self.forward(imgs)  # forward
-                import pdb; pdb.set_trace()
                 loss, loss_items = compute_loss(pred, targets, self.model)  # loss scaled by batch_size
                 
                 if self.rank != -1:
                     loss *= self.opt.world_size  # gradient averaged between devices in DDP mode
             
             # Backward
-            loss.backward()
-
+            self.scaler.scale(loss).backward()
             # Optimize
             if ni % self.accumulate == 0:
-                #self.scaler.step(self.optimizer)  # optimizer.step
-                self.optimizer.step()
-                #self.optimizer.zero_grad()
-                #self.scaler.update()
+                self.scaler.step(self.optimizer)  # optimizer.step
+                self.scaler.update()
                 self.optimizer.zero_grad()
-                #if self.ema:
+                if self.ema:
                     # Optimize
-                #    self.ema.update(self.model)
+                    self.ema_update()
 
             # Print
             if self.rank in [-1, 0]:
@@ -520,18 +590,17 @@ class Model(pl.LightningModule):
                 # Scheduler
                 lr = [x['lr'] for x in self.optimizer.param_groups]  # for tensorboard
                 self.lr_scheduler.step()
-                
+
                 results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
                 # DDP process 0 or single-GPU
                 if self.rank in [-1, 0]:
                     # mAP
-                    #if self.ema:
-                    #    ema.update_attr(self.model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
+                    if self.ema:
+                        self.ema_update_attr( include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
                     final_epoch = self.current_epoch + 1 == self.epochs
                     if not self.opt.notest or final_epoch:  # Calculate mAP
                     #Test function
                          self.test()
-
                           # Write
                     with open(self.results_file, 'a') as f:
                         f.write(self.s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
@@ -561,7 +630,7 @@ class Model(pl.LightningModule):
                             ckpt = {'epoch': self.current_epoch,
                                     'best_fitness': self.best_fitness,
                                     'training_results': f.read(),
-                                    'model': self.model,
+                                    'model': self.ema.ema,
                                     'optimizer': None if final_epoch else self.optimizer.state_dict(),
                                     'wandb_id': None}
 
@@ -570,7 +639,6 @@ class Model(pl.LightningModule):
                         if self.best_fitness == fi:
                             torch.save(ckpt, self.best)
                         del ckpt
-
 ##################################### TESTING #################################
     def test(self,
              weights=None,
@@ -624,8 +692,9 @@ class Model(pl.LightningModule):
         """
         # Half
         half = device.type != 'cpu'  # half precision only supported on CUDA
-        if half:
-            self.model.half()
+        half = False
+        if half : 
+           self.model.half()
 
         # Configure
         self.model.eval()
@@ -670,7 +739,6 @@ class Model(pl.LightningModule):
                 t1 += time_synchronized() - t
             
             # Statistics per image
-            print(paths[0]) 
             for si, pred in enumerate(output):
                 labels = targets[targets[:, 0] == si, 1:]
                 nl = len(labels)
@@ -771,7 +839,12 @@ class Model(pl.LightningModule):
         t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
         if not training:
             print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+        self.model.train()
 
+
+
+def is_parallel(model):
+    return type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
 
 def parse_model(d, ch):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
@@ -915,5 +988,5 @@ if __name__ == '__main__':
      
 
     model = Model(opt,hyp,opt.cfg)
-    trainer = pl.Trainer(limit_train_batches=2, gpus=1) 
+    trainer = pl.Trainer(gpus=1) 
     trainer.fit(model)

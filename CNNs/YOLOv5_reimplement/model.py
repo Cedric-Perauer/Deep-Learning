@@ -55,7 +55,7 @@ class Detect(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
 
-    def __init__(self, nc=5, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
@@ -98,71 +98,57 @@ class Detect(nn.Module):
 class Model(pl.LightningModule):
     def __init__(self, opt,hyp,cfg='yolov5s.yaml',pretrained=True, ch=3, nc=5,tb_writer=None):  # model, input channels, number of classes
         super(Model, self).__init__()
-        if isinstance(cfg, dict):
-            self.yaml = cfg  # model dict
-        else:  # is *.yaml
-            import yaml  # for torch hub
-            self.yaml_file = Path(cfg).name
-            with open(cfg) as f:
-                self.yaml = yaml.load(f, Loader=yaml.FullLoader)  # model dict
         
-        self.pretrained = pretrained 
         self.nc = nc
         self.hyp = hyp  
         self.opt = opt
         self.tb_writer = tb_writer
-        self.ch = ch
+        self.ch = ch 
+        self.pretrained = pretrained
         #init seeds
 
         init_seeds(2 + self.opt.global_rank)
-        # Define model
-        if nc and nc != self.yaml['nc']:
-            print('Overriding model.yaml nc=%g with nc=%g' % (self.yaml['nc'], nc))
-            self.yaml['nc'] = nc  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
-        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
         
-        
-
-        # Build strides, anchors
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
-            s = 128  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            m.anchors /= m.stride.view(-1, 1, 1)
-            check_anchor_order(m)
-            self.stride = m.stride
-            self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
-
-        initialize_weights(self)
-        self.info()
         self.config()
-        self.run_save()
         self.load_model()
+        self.info()
+        self.run_save()
         self.wandb_logging()
         self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
     
-    def model_create(self): 
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist, ch_out
-        # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
-        
-        
+    def model_create(self,cfg): 
+            if isinstance(cfg, dict):
+                self.yaml = cfg  # model dict
+            else:  # is *.yaml
+                import yaml  # for torch hub
+                self.yaml_file = Path(cfg).name
+                with open(cfg) as f:
+                  self.yaml = yaml.load(f, Loader=yaml.FullLoader)  # model dict
+               
+            
+            self.model, self.save = parse_model(deepcopy(self.yaml), ch=[self.ch])  # model, savelist, ch_out
+            # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
+            
+            
 
-        # Build strides, anchors
-        m = self.model[-1]  # Detect()
-        if isinstance(m, Detect):
-            s = 128  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
-            m.anchors /= m.stride.view(-1, 1, 1)
-            check_anchor_order(m)
-            self.stride = m.stride
-            self._initialize_biases()  # only run once
-            # print('Strides: %s' % m.stride.tolist())
+            # Build strides, anchors
+            m = self.model[-1]  # Detect()
+            if isinstance(m, Detect):
+                s = 128  # 2x min stride
+                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, self.ch, s, s))])  # forward
+                m.anchors /= m.stride.view(-1, 1, 1)
+                check_anchor_order(m)
+                self.stride = m.stride
+                self._initialize_biases()  # only run once
+                # print('Strides: %s' % m.stride.tolist())
 
-        initialize_weights(self)
+            initialize_weights(self)
+    
+
+
+        
     
     def config(self):
         logger.info(f'Hyperparameters {hyp}')
@@ -312,6 +298,7 @@ class Model(pl.LightningModule):
             self.ckpt = torch.load(self.weights)  # load checkpoint
             if self.hyp.get('anchors'):
                 self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
+            self.model_create(self.ckpt["model"].yaml)
             exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
             state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
             #state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
@@ -327,24 +314,8 @@ class Model(pl.LightningModule):
                     print('freezing %s' % k)
                     v.requires_grad = False
         else:
-            self.model, self.save = parse_model(deepcopy(self.yaml), ch=[self.ch])  # model, savelist, ch_out
-            # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
-            
-            
+            self.model_create(self.ckpt["model"].yaml)
 
-            # Build strides, anchors
-            m = self.model[-1]  # Detect()
-            if isinstance(m, Detect):
-                s = 128  # 2x min stride
-                m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, self.ch, s, s))])  # forward
-                m.anchors /= m.stride.view(-1, 1, 1)
-                check_anchor_order(m)
-                self.stride = m.stride
-                self._initialize_biases()  # only run once
-                # print('Strides: %s' % m.stride.tolist())
-
-            initialize_weights(self)
-    
     def wandb_logging(self): 
         if wandb and wandb.run is None:
             id = self.ckpt.get('wandb_id') if 'ckpt' in locals() else None
@@ -808,11 +779,11 @@ class Model(pl.LightningModule):
                 # Append statistics (correct, conf, pcls, tcls)
                 stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
             # Plot images
-            if plots and batch_i < 1:
-                f = save_dir / f'test_batch{batch_i}_gt.jpg'  # filename
-                plot_images(img, targets, paths, str(f), names)  # ground truth
-                f = save_dir / f'test_batch{batch_i}_pred.jpg'
-                plot_images(img, output_to_target(output, width, height), paths, str(f), names)  # predictions
+            #if plots and batch_i < 1:
+            #    f = save_dir / f'test_batch{batch_i}_gt.jpg'  # filename
+            #    plot_images(img, targets, paths, str(f), names)  # ground truth
+            #    f = save_dir / f'test_batch{batch_i}_pred.jpg'
+            #   plot_images(img, output_to_target(output, width, height), paths, str(f), names)  # predictions
         # Compute statistics
         stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
         if len(stats) and stats[0].any():
@@ -901,7 +872,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolov5s.pt', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='models/yolov5s.yaml', help='model.yaml path')
+    parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
     parser.add_argument('--data', type=str, default='data/coco128.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
@@ -992,7 +963,7 @@ if __name__ == '__main__':
                 logger.info("Install Weights & Biases for experiment logging via 'pip install wandb' (recommended)")
      
 
-    model = Model(opt,hyp,opt.cfg,pretrained=False)
+    model = Model(opt,hyp,opt.cfg,pretrained=True)
     trainer = pl.Trainer(gpus=1) 
     #trainer = pl.Trainer(limit_train_batches=10,gpus=1) 
     trainer.fit(model)

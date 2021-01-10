@@ -96,7 +96,7 @@ class Detect(nn.Module):
 
 
 class Model(pl.LightningModule):
-    def __init__(self, opt,hyp,cfg='yolov5s.yaml', ch=3, nc=5,tb_writer=None):  # model, input channels, number of classes
+    def __init__(self, opt,hyp,cfg='yolov5s.yaml',pretrained=True, ch=3, nc=5,tb_writer=None):  # model, input channels, number of classes
         super(Model, self).__init__()
         if isinstance(cfg, dict):
             self.yaml = cfg  # model dict
@@ -106,6 +106,7 @@ class Model(pl.LightningModule):
             with open(cfg) as f:
                 self.yaml = yaml.load(f, Loader=yaml.FullLoader)  # model dict
         
+        self.pretrained = pretrained 
         self.nc = nc
         self.hyp = hyp  
         self.opt = opt
@@ -139,7 +140,7 @@ class Model(pl.LightningModule):
         self.config()
         self.run_save()
         self.load_model()
-        #self.wandb_logging()
+        self.wandb_logging()
         self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
@@ -236,7 +237,6 @@ class Model(pl.LightningModule):
         self.decay = lambda x: decay * (1 - math.exp(-x / 2000))  # decay exponential ramp (to help early epochs)
         for p in ema.parameters():
             p.requires_grad_(False)
-        import pdb;pdb.set_trace()
         return ema
 
     def ema_update(self):
@@ -244,13 +244,12 @@ class Model(pl.LightningModule):
             self.updates += 1
             d = self.decay(self.updates)
             
-            import pdb;pdb.set_trace()
             msd = self.model.module.state_dict() if is_parallel(self.model) else self.model.state_dict()  # model state_dict
             for k, v in self.ema.state_dict().items():
                 if v.dtype.is_floating_point:
                     v *= d
                     v += (1. - d) * msd[k].detach()
-    
+
     def ema_update_attr(self,include=(),exclude=("process_group","reducer")): 
         copy_attr(self.ema, self.model, include, exclude) 
 
@@ -278,8 +277,8 @@ class Model(pl.LightningModule):
                 if self.tb_writer:
                     # tb_writer.add_hparams(hyp, {})  # causes duplicate https://github.com/ultralytics/yolov5/pull/384
                     self.tb_writer.add_histogram('classes', c, 0)
-         
-        import pdb; pdb.set_trace() 
+                if not self.opt.noautoanchor:
+                    check_anchors(self.dataset, model=self.model, thr=hyp['anchor_t'], imgsz=self.imgsz)
 
         # Model parameters
         self.hyp['cls'] *= self.nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
@@ -297,7 +296,7 @@ class Model(pl.LightningModule):
                 'Starting training for %g epochs...' % (self.imgsz, self.imgsz_test, self.train_dataloader.num_workers, self.log_dir, self.epochs))
      
         self.cuda = device.type != 'cpu' 
-        self.scaler = amp.GradScaler(enabled=self.cuda)
+        self.scaler = amp.GradScaler(enabled=False)
 
 
     def intersect_dicts(self,da, db, exclude=()):
@@ -308,7 +307,6 @@ class Model(pl.LightningModule):
 
     def load_model(self): 
         # Model
-        self.pretrained = True
         if self.pretrained : 
             print("Loading model") 
             self.ckpt = torch.load(self.weights)  # load checkpoint
@@ -323,7 +321,7 @@ class Model(pl.LightningModule):
             #freeeze paramaters 
             # Freeze
             freeze = []  # parameter names to freeze (full or partial)
-            for k, v in self.named_parameters():
+            for k, v in self.model.named_parameters():
                 v.requires_grad = True  # train all layers
                 if any(x in k for x in freeze):
                     print('freezing %s' % k)
@@ -520,7 +518,6 @@ class Model(pl.LightningModule):
 
     def training_step(self,batch,batch_idx):
             
-            print("Training Step")
             self.batch_count = 0 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
@@ -547,7 +544,7 @@ class Model(pl.LightningModule):
                     imgs = F.interpolate(self.imgs, size=ns, mode='bilinear', align_corners=False)
             
             # Forward
-            with amp.autocast(enabled=self.cuda):
+            with amp.autocast(enabled=False):
                 
 
                 pred = self.forward(imgs)  # forward
@@ -559,6 +556,7 @@ class Model(pl.LightningModule):
             # Backward
             self.scaler.scale(loss).backward()
             # Optimize
+            
             if ni % self.accumulate == 0:
                 self.scaler.step(self.optimizer)  # optimizer.step
                 self.scaler.update()
@@ -566,19 +564,18 @@ class Model(pl.LightningModule):
                 if self.ema:
                     # Optimize
                     self.ema_update()
-
+           
             # Print
             if self.rank in [-1, 0]:
                 self.mloss = (self.mloss * self.batch_count + loss_items) / (self.batch_count + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 self.s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (self.current_epoch, self.epochs - 1), mem, *self.mloss, targets.shape[0], imgs.shape[-1])
-                print("----------------------------") 
                 print("Mloss is : ",*self.mloss)
                 # Plot
-                if ni < 3:
-                    f = str(self.log_dir / f'train_batch{ni}.jpg')  # filename
-                    result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+                #if ni < 3:
+                    #f = str(self.log_dir / f'train_batch{ni}.jpg')  # filename
+                    #result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
                     # if tb_writer and result is not None:
                     # tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     # tb_writer.add_graph(model, imgs)  # add model to tensorboard
@@ -600,7 +597,7 @@ class Model(pl.LightningModule):
                     final_epoch = self.current_epoch + 1 == self.epochs
                     if not self.opt.notest or final_epoch:  # Calculate mAP
                     #Test function
-                         self.test()
+                          results, maps, times = self.test()
                           # Write
                     with open(self.results_file, 'a') as f:
                         f.write(self.s + '%10.4g' * 7 % results + '\n')  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
@@ -615,8 +612,8 @@ class Model(pl.LightningModule):
                     for x, tag in zip(list(self.mloss[:-1]) + list(results) + lr, tags):
                         if self.tb_writer:
                             self.tb_writer.add_scalar(tag, x, self.current_epoch)  # tensorboard
-                        #if wandb:
-                            #wandb.log({tag: x})  # W&B
+                        if wandb:
+                            wandb.log({tag: x})  # W&B
 
                     # Update best mAP
                     fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -630,7 +627,7 @@ class Model(pl.LightningModule):
                             ckpt = {'epoch': self.current_epoch,
                                     'best_fitness': self.best_fitness,
                                     'training_results': f.read(),
-                                    'model': self.ema.ema,
+                                    'model': self.ema,
                                     'optimizer': None if final_epoch else self.optimizer.state_dict(),
                                     'wandb_id': None}
 
@@ -644,8 +641,8 @@ class Model(pl.LightningModule):
              weights=None,
              batch_size=16,
              imgsz=640,
-             conf_thres=0.25,
-             iou_thres=0.5,  # for NMS
+             conf_thres=0.001,
+             iou_thres=0.6,  # for NMS
              save_json=False,
              single_cls=False,
              augment=False,
@@ -839,9 +836,17 @@ class Model(pl.LightningModule):
         t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
         if not training:
             print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
+        
+
+        #set model back to train mode 
+        self.model.float()
         self.model.train()
+        maps = np.zeros(self.nc) + map 
+        for i, c in enumerate(ap_class):
+            maps[c] = ap[i]
+        return (mp, mr, map50, map, *(loss.cpu() / len(self.test_dataloader)).tolist()), maps, t
 
-
+        
 
 def is_parallel(model):
     return type(model) in (nn.parallel.DataParallel, nn.parallel.DistributedDataParallel)
@@ -987,6 +992,7 @@ if __name__ == '__main__':
                 logger.info("Install Weights & Biases for experiment logging via 'pip install wandb' (recommended)")
      
 
-    model = Model(opt,hyp,opt.cfg)
+    model = Model(opt,hyp,opt.cfg,pretrained=False)
     trainer = pl.Trainer(gpus=1) 
+    #trainer = pl.Trainer(limit_train_batches=10,gpus=1) 
     trainer.fit(model)

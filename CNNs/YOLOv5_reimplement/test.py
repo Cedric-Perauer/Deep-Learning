@@ -13,7 +13,7 @@ from tqdm import tqdm
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
 from utils.general import (
-    coco80_to_coco91_class, check_dataset, check_file, check_img_size, compute_loss, non_max_suppression, scale_coords,
+    coco80_to_coco91_class, check_dataset, check_file, check_img_size, compute_losst, non_max_suppression, scale_coords,
     xyxy2xywh, clip_coords, plot_images, xywh2xyxy, box_iou, output_to_target, ap_per_class, set_logging)
 from utils.torch_utils import select_device, time_synchronized
 
@@ -114,7 +114,7 @@ def test(data,
 
             # Compute loss
             if training:  # if model has loss hyperparameters
-                loss += compute_loss([x.float() for x in train_out], targets, model)[1][:3]  # box, obj, cls
+                loss += compute_losst([x.float() for x in train_out], targets, model)[1][:3]  # box, obj, cls
 
             # Run NMS
             t = time_synchronized()
@@ -171,9 +171,7 @@ def test(data,
                 # target boxes
                 tbox = xywh2xyxy(labels[:, 1:5]) * whwh
 
-                # Per target class
-                import pdb 
-                pdb.set_trace()
+               
                 for cls in torch.unique(tcls_tensor):
                     ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
                     pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices

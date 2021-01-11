@@ -55,7 +55,7 @@ class Detect(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
 
-    def __init__(self, nc=80, anchors=(), ch=()):  # detection layer
+    def __init__(self, nc=5, anchors=(), ch=()):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
         self.no = nc + 5  # number of outputs per anchor
@@ -111,11 +111,11 @@ class Model(pl.LightningModule):
         
         self.config()
         self.load_model()
+        
+        self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.info()
         self.run_save()
         self.wandb_logging()
-        self.optimizer, self.lr_scheduler = self.configure_optimizers()
-        self.optimizer, self.lr_scheduler = self.optimizer[0], self.lr_scheduler[0]
         self.resume()
     
     def model_create(self,cfg): 
@@ -263,8 +263,8 @@ class Model(pl.LightningModule):
                 if self.tb_writer:
                     # tb_writer.add_hparams(hyp, {})  # causes duplicate https://github.com/ultralytics/yolov5/pull/384
                     self.tb_writer.add_histogram('classes', c, 0)
-                if not self.opt.noautoanchor:
-                    check_anchors(self.dataset, model=self.model, thr=hyp['anchor_t'], imgsz=self.imgsz)
+                #if not self.opt.noautoanchor:
+                #check_anchors(self.dataset, model=self.model, thr=hyp['anchor_t'], imgsz=self.imgsz)
 
         # Model parameters
         self.hyp['cls'] *= self.nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
@@ -297,11 +297,11 @@ class Model(pl.LightningModule):
             print("Loading model") 
             self.ckpt = torch.load(self.weights)  # load checkpoint
             if self.hyp.get('anchors'):
-                self.ckpt['model'].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
+                self.ckpt["model"].yaml['anchors'] = round(self.hyp['anchors'])  # force autoanchor
             self.model_create(self.ckpt["model"].yaml)
-            exclude = ['anchor'] if self.opt.cfg or self.hyp.get('anchors') else []  # exclude keys
-            state_dict = self.ckpt['model'].model.float().state_dict()  # to FP32
-            #state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
+            exclude = ['anchor',"24.m.2.bias","24.m.2.weight","24.m.1.weight","24.m.1.bias","24.m.0.weight","24.m.0.bias"] 
+            state_dict = self.ckpt["model"].model.float().state_dict()  # to FP32
+            state_dict = self.intersect_dicts(state_dict, self.model.state_dict(), exclude=exclude)  # intersect
             self.model.load_state_dict(state_dict, strict=False)  # load
             logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(self.model.state_dict()), self.weights))  # report
             del state_dict 
@@ -315,6 +315,7 @@ class Model(pl.LightningModule):
                     v.requires_grad = False
         else:
             self.model_create(self.ckpt["model"].yaml)
+        self.model.train()
 
     def wandb_logging(self): 
         if wandb and wandb.run is None:
@@ -470,6 +471,7 @@ class Model(pl.LightningModule):
                 pg0.append(v.weight)  # no decay
             elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
                 pg1.append(v.weight)  # apply decay
+        
         if self.opt.adam:
             optimizer = optim.Adam(pg0, lr=self.hyp['lr0'], betas=(self.hyp['momentum'], 0.999))  # adjust beta1 to momentum
         else:
@@ -489,6 +491,8 @@ class Model(pl.LightningModule):
 
     def training_step(self,batch,batch_idx):
             
+            optims = self.configure_optimizers()
+            optimizer, self.lr_scheduler = optims[0][0],optims[1][0]
             self.batch_count = 0 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
@@ -500,9 +504,9 @@ class Model(pl.LightningModule):
                 xi = [0,self.nw]  # x interp
                 # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
                 accumulate = max(1, np.interp(ni, xi, [1, self.nbs / self.total_batch_size]).round())
-                for j, x in enumerate(self.optimizer.param_groups):
+                for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
-                    x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(self.current_epoch)])
+                    x['lr'] = np.interp(ni, xi, [self.hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(self.current_epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [self.hyp['warmup_momentum'], self.hyp['momentum']])
             
@@ -527,36 +531,24 @@ class Model(pl.LightningModule):
             # Backward
             self.scaler.scale(loss).backward()
             # Optimize
-            
-            if ni % self.accumulate == 0:
-                self.scaler.step(self.optimizer)  # optimizer.step
-                self.scaler.update()
-                self.optimizer.zero_grad()
-                if self.ema:
-                    # Optimize
-                    self.ema_update()
-           
+             
+            self.scaler.step(optimizer)  # optimizer.step
+            self.scaler.update()
+            optimizer.zero_grad()
+            if self.ema:
+                self.ema_update()
+       
             # Print
             if self.rank in [-1, 0]:
                 self.mloss = (self.mloss * self.batch_count + loss_items) / (self.batch_count + 1)  # update mean losses
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 self.s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (self.current_epoch, self.epochs - 1), mem, *self.mloss, targets.shape[0], imgs.shape[-1])
-                print("Mloss is : ",*self.mloss)
-                # Plot
-                #if ni < 3:
-                    #f = str(self.log_dir / f'train_batch{ni}.jpg')  # filename
-                    #result = plot_images(images=imgs, targets=targets, paths=paths, fname=f)
-                    # if tb_writer and result is not None:
-                    # tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
-                    # tb_writer.add_graph(model, imgs)  # add model to tensorboard
-            # end batch ------------------------------------------------------------------------------------------------
-            
+                self.log("train_loss" , loss) 
 
     def on_epoch_end(self): 
                 print("epoch end") 
                 # Scheduler
-                lr = [x['lr'] for x in self.optimizer.param_groups]  # for tensorboard
                 self.lr_scheduler.step()
 
                 results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
@@ -579,8 +571,8 @@ class Model(pl.LightningModule):
                     tags = ['train/giou_loss', 'train/obj_loss', 'train/cls_loss',  # train loss
                             'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95',
                             'val/giou_loss', 'val/obj_loss', 'val/cls_loss',  # val loss
-                            'x/lr0', 'x/lr1', 'x/lr2']  # params
-                    for x, tag in zip(list(self.mloss[:-1]) + list(results) + lr, tags):
+                            ]  # params
+                    for x, tag in zip(list(self.mloss[:-1]) + list(results) , tags):
                         if self.tb_writer:
                             self.tb_writer.add_scalar(tag, x, self.current_epoch)  # tensorboard
                         if wandb:
@@ -599,7 +591,6 @@ class Model(pl.LightningModule):
                                     'best_fitness': self.best_fitness,
                                     'training_results': f.read(),
                                     'model': self.ema,
-                                    'optimizer': None if final_epoch else self.optimizer.state_dict(),
                                     'wandb_id': None}
 
                         # Save last, best and delete
@@ -825,9 +816,10 @@ def is_parallel(model):
 def parse_model(d, ch):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+    nc = 5
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
     no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
-
+      
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
         m = eval(m) if isinstance(m, str) else m  # eval strings
@@ -962,7 +954,7 @@ if __name__ == '__main__':
                 opt.log_imgs = 0
                 logger.info("Install Weights & Biases for experiment logging via 'pip install wandb' (recommended)")
      
-
+          
     model = Model(opt,hyp,opt.cfg,pretrained=True)
     trainer = pl.Trainer(gpus=1) 
     #trainer = pl.Trainer(limit_train_batches=10,gpus=1) 

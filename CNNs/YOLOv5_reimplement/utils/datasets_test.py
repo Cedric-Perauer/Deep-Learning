@@ -335,12 +335,20 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.tag_mode = False
+        self.cuda_preds = True        
+
 
         def img2label_paths(img_paths):
             # Define label paths as a function of image paths
             sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
             return [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in img_paths]
-
+         
+         #for cuda preds
+        def img2labelpred_paths(img_paths):
+            # Define label paths as a function of image paths
+            sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels_pred' + os.sep  # /images/, /labels/ substrings
+            return [x.replace(sa, sb, 1).replace(os.path.splitext(x)[-1], '.txt') for x in img_paths]
+        
         try:
             f = []  # image files
             for p in path if isinstance(path, list) else [path]:
@@ -369,6 +377,22 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 cache = self.cache_labels(cache_path)  # re-cache
         else:
             cache = self.cache_labels(cache_path)  # cache
+        
+        # Check cache
+        self.labelpred_files = img2labelpred_paths(self.img_files)  # labels
+        cache_path = str(Path(self.labelpred_files[0]).parent) + '.cache'  # cached labels
+        if os.path.isfile(cache_path):
+            cachepred = torch.load(cache_path)  # load
+            if cachepred['hash'] != get_hash(self.labelpred_files + self.img_files):  # dataset changed
+                cachepred = self.cache_labelspred(cache_path)  # re-cache
+        else:
+            cachepred = self.cache_labelspred(cache_path) # cache for preds
+        
+
+        cachepred.pop('hash')
+        labelspred, shapes = zip(*cachepred.values())
+        self.labelspred = list(labelspred)
+        self.labelpred_files = img2label_paths(cachepred.keys())
 
         # Read cache
         cache.pop('hash')  # remove hash
@@ -394,6 +418,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             self.label_files = [self.label_files[i] for i in irect]
             self.labels = [self.labels[i] for i in irect]
             self.shapes = s[irect]  # wh
+            
+            self.labelpred_files = [self.labelpred_files[i] for i in irect]
+            self.labelspred = [self.labelspred[i] for i in irect]
             ar = ar[irect]
 
             # Set training image shapes
@@ -418,7 +445,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             l = self.labels[i]  # label
             if not self.tag_mode : 
                 l = l[:,:-1] 
-
+                
             if l is not None and l.shape[0]:
                 #assert l.shape[1] == 5, '> 5 label columns: %s' % file
                 #assert (l >= 0).all(), 'negative labels: %s' % file
@@ -431,36 +458,6 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 
                 nf += 1  # file found
 
-                # Create subdataset (a smaller dataset)
-                if create_datasubset and ns < 1E4:
-                    if ns == 0:
-                        create_folder(path='./datasubset')
-                        os.makedirs('./datasubset/images')
-                    exclude_classes = 43
-                    if exclude_classes not in l[:, 0]:
-                        ns += 1
-                        # shutil.copy(src=self.img_files[i], dst='./datasubset/images/')  # copy image
-                        with open('./datasubset/images.txt', 'a') as f:
-                            f.write(self.img_files[i] + '\n')
-
-                # Extract object detection boxes for a second stage classifier
-                if extract_bounding_boxes:
-                    p = Path(self.img_files[i])
-                    img = cv2.imread(str(p))
-                    h, w = img.shape[:2]
-                    for j, x in enumerate(l):
-                        f = '%s%sclassifier%s%g_%g_%s' % (p.parent.parent, os.sep, os.sep, x[0], j, p.name)
-                        if not os.path.exists(Path(f).parent):
-                            os.makedirs(Path(f).parent)  # make new output folder
-
-                        b = x[1:] * [w, h, w, h]  # box
-                        b[2:] = b[2:].max()  # rectangle to square
-                        b[2:] = b[2:] * 1.3 + 30  # pad
-                        b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
-
-                        b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
-                        b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
-                        assert cv2.imwrite(f, img[b[1]:b[3], b[0]:b[2]]), 'Failure extracting classifier boxes'
             else:
                 ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
                 # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
@@ -468,6 +465,35 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             if rank in [-1, 0]:
                 pbar.desc = 'Scanning labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
                     cache_path, nf, nm, ne, nd, n)
+        ####################################################################cuda preds #################################################################
+        create_datasubset, extract_bounding_boxes, labels_loaded = False, False, False
+        nm, nf, ne, ns, nd = 0, 0, 0, 0, 0  # number missing, found, empty, datasubset, duplicate
+        pbar = enumerate(self.labelpred_files)
+        if rank in [-1, 0]:
+            pbar = tqdm(pbar)
+        for i, file in pbar:
+            l = self.labelspred[i]  # label
+            if not self.tag_mode : 
+                l = l[:,:-1]
+            if l is not None and l.shape[0]:
+                #assert l.shape[1] == 5, '> 5 label columns: %s' % file
+                #assert (l >= 0).all(), 'negative labels: %s' % file
+                #assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels: %s' % file
+                if np.unique(l, axis=0).shape[0] < l.shape[0]:  # duplicate rows
+                    nd += 1  # print('WARNING: duplicate rows in %s' % self.label_files[i])  # duplicate rows
+                if single_cls:
+                    l[:, 0] = 0  # force dataset into single-class mode
+                self.labelspred[i] = l
+                
+                nf += 1  # file found
+            else:
+                ne += 1  # print('empty labels for image %s' % self.img_files[i])  # file empty
+                # os.system("rm '%s' '%s'" % (self.img_files[i], self.label_files[i]))  # remove
+
+            if rank in [-1, 0]:
+                pbar.desc = 'Scanning labels %s (%g found, %g missing, %g empty, %g duplicate, for %g images)' % (
+                    cache_path, nf, nm, ne, nd, n)
+
         if nf == 0:
             s = 'WARNING: No labels found in %s. See %s' % (os.path.dirname(file) + os.sep, help_url)
             print(s)
@@ -508,6 +534,30 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         torch.save(x, path)  # save for next time
         return x
 
+    def cache_labelspred(self, path='labelspred.cache'):
+        # Cache dataset labels, check images and read shapes
+        x = {}  # dict
+        pbar = tqdm(zip(self.img_files, self.labelpred_files), desc='Scanning images', total=len(self.img_files))
+        for (img, label) in pbar:
+            try:
+                l = []
+                im = Image.open(img)
+                im.verify()  # PIL verify
+                shape = exif_size(im)  # image size
+                assert (shape[0] > 9) & (shape[1] > 9), 'image size <10 pixels'
+                if os.path.isfile(label):
+                    with open(label, 'r') as f:
+                        l = np.array([x.split() for x in f.read().splitlines()], dtype=np.float32)  # labels
+                if len(l) == 0:
+                    l = np.zeros((0, 5), dtype=np.float32)
+                x[img] = [l, shape]
+            except Exception as e:
+                print('WARNING: Ignoring corrupted image and/or label %s: %s' % (img, e))
+
+        x['hash'] = get_hash(self.labelpred_files + self.img_files)
+        torch.save(x, path)  # save for next time
+        return x
+    
     def __len__(self):
         return len(self.img_files)
 
@@ -543,9 +593,13 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             shape = self.batch_shapes[self.batch[index]] if self.rect else self.img_size  # final letterboxed shape
             img, ratio, pad = letterbox(img, shape, auto=False, scaleup=self.augment)
             shapes = (h0, w0), ((h / h0, w / w0), pad)  # for COCO mAP rescaling
+
             # Load labels
             labels = []
             x = self.labels[index]
+            
+            predictions = []
+            preds = self.labelspred[index]
             if x.size > 0:
                 # Normalized xywh to pixel xyxy format
                 labels = x.copy()
@@ -553,6 +607,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 labels[:, 2] = ratio[1] * h * (x[:, 2] - x[:, 4] / 2) + pad[1]  # pad height
                 labels[:, 3] = ratio[0] * w * (x[:, 1] + x[:, 3] / 2) + pad[0]
                 labels[:, 4] = ratio[1] * h * (x[:, 2] + x[:, 4] / 2) + pad[1]
+            
+            if preds.size > 0:
+                # Normalized xywh to pixel xyxy format
+                predictions = preds.copy()
+                predictions[:, 1] = ratio[0] * w * (preds[:, 1] - preds[:, 3] / 2) + pad[0]  # pad width
+                predictions[:, 2] = ratio[1] * h * (preds[:, 2] - preds[:, 4] / 2) + pad[1]  # pad height
+                predictions[:, 3] = ratio[0] * w * (preds[:, 1] + preds[:, 3] / 2) + pad[0]
+                predictions[:, 4] = ratio[1] * h * (preds[:, 2] + preds[:, 4] / 2) + pad[1]
+
 
         if self.augment:
             # Augment imagespace
@@ -579,6 +642,17 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             labels[:, 1:5] = xyxy2xywh(labels[:, 1:5])  # convert xyxy to xywh
             labels[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
             labels[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+        
+        nP = len(predictions) #number of predictions for cuda
+        if self.tag_mode : 
+           
+           predictions = predictions[:,:-1]
+        if nP:
+            predictions[:, 1:5] = xyxy2xywh(predictions[:, 1:5])  # convert xyxy to xywh
+            predictions[:, [2, 4]] /= img.shape[0]  # normalized height 0-1
+            predictions[:, [1, 3]] /= img.shape[1]  # normalized width 0-1
+
+
 
         if self.augment:
             # flip up-down
@@ -596,32 +670,57 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         labels_out = torch.zeros((nL, 6))
         if nL:
             labels_out[:, 1:] = torch.from_numpy(labels)
+      
+
+        preds_out = torch.zeros((nP, 6))
+        if nP:
+            preds_out[:, 1:] = torch.from_numpy(predictions)
 
         # Convert
         img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
         img = np.ascontiguousarray(img)
-        
-        if self.tag_mode : 
-              return torch.from_numpy(img), labels_out, self.img_files[index], shapes, tags
-        else :
+
+
+        if self.tag_mode and self.cuda_preds : 
+              return torch.from_numpy(img), labels_out, self.img_files[index], shapes, tags, preds_out
+        elif not self.tag_mode and not self.cuda_preds : 
               return torch.from_numpy(img), labels_out, self.img_files[index], shapes
-    
+        elif not self.tag_mode and self.cuda_preds :
+              return torch.from_numpy(img), labels_out, self.img_files[index], shapes, preds_out
+        elif self.tag_mode and not self.cuda_preds : 
+              return torch.from_numpy(img), labels_out, self.img_files[index], shapes, tags 
+        
+
+
     @staticmethod
     def collate_fn(batch):
         
-        test_mode = False
-        if test_mode : 
+        tag_mode = False
+        cuda_mode = True
+        if tag_mode and not cuda_mode: 
             img, label, path, shapes, tags = zip(*batch)  # transposed
-        else : 
+        elif not tag_mode and not cuda_mode: 
             img, label, path, shapes = zip(*batch)  # transposed
+        elif not tag_mode and cuda_mode: 
+            img, label, path, shapes, preds = zip(*batch)  # transposed
+        elif test_mode and cuda_mode: 
+            img, label, path, shapes, tags, preds = zip(*batch)  # transposed
+
 
          
         for i, l in enumerate(label):
             l[:, 0] = i  # add target image index for build_targets()
-        if test_mode : 
+        if tag_mode and not cuda_mode: 
                  return torch.stack(img, 0), torch.cat(label, 0), path, shapes, tags
-        else : 
-            return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        
+        elif not tag_mode and not cuda_mode: 
+                 return torch.stack(img, 0), torch.cat(label, 0), path, shapes
+        
+        elif not tag_mode and cuda_mode: 
+                 return torch.stack(img, 0), torch.cat(label, 0), path, shapes, torch.cat(preds,0)
+        
+        elif test_mode and cuda_mode: 
+                 return torch.stack(img, 0), torch.cat(label, 0), path, shapes, tags,torch.cat(preds,0)
 
 
 # Ancillary functions --------------------------------------------------------------------------------------------------

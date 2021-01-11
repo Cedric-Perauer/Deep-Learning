@@ -86,7 +86,7 @@ def check_img_size(img_size, s=32):
 def check_anchors(dataset, model, thr=4.0, imgsz=640):
     # Check anchor fit to data, recompute if necessary
     print('\nAnalyzing anchors... ', end='')
-    m = model.module.model[-1] if hasattr(model, 'module') else model.model[-1]  # Detect()
+    m = model.module[-1] if hasattr(model, 'module') else model[-1]  # Detect()
     shapes = imgsz * dataset.shapes / dataset.shapes.max(1, keepdims=True)
     scale = np.random.uniform(0.9, 1.1, size=(shapes.shape[0], 1))  # augment scale
     wh = torch.tensor(np.concatenate([l[:, 3:5] * s for s, l in zip(shapes * scale, dataset.labels)])).float()  # wh
@@ -381,14 +381,13 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, fname='precision-re
         py = np.stack(py, axis=1)
         fig, ax = plt.subplots(1, 1, figsize=(5, 5))
         ax.plot(px, py, linewidth=0.5, color='grey')  # plot(recall, precision)
-        ax.plot(px, py[:,:-1].mean(1), linewidth=2, color='magenta',label='all except for unknown %.3f mAP@0.5' % ap[:-1, 0].mean())  # plot(recall, precision)
         ax.plot(px, py.mean(1), linewidth=2, color='black', label='all classes %.3f mAP@0.5' % ap[:, 0].mean())
         ax.set_xlabel('Recall')
         ax.set_ylabel('Precision')
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         plt.legend(loc='center left', bbox_to_anchor=(0.2, 0.2))
-        fig.savefig(fname, dpi=200)
+        #fig.savefig(fname, dpi=200)
 
     return p, r, ap, f1, unique_classes.astype('int32')
 
@@ -610,14 +609,14 @@ def compute_loss(p, targets, model):  # predictions, targets, model
     lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
     lcls *= h['cls'] * s
     bs = tobj.shape[0]  # batch size
-
     loss = lbox + lobj + lcls
     return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
 
 
 def build_targets(p, targets, model):
     # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
-    det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    
+    det = model[-1]  # Detect() module
     na, nt = det.na, targets.shape[0]  # number of anchors, targets
     tcls, tbox, indices, anch = [], [], [], []
     gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
@@ -631,9 +630,9 @@ def build_targets(p, targets, model):
                         ], device=targets.device).float() * g  # offsets
 
     for i in range(det.nl):
-        anchors = det.anchors[i]
+        anchors = det.anchors[i]  
         gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
-
+         
         # Match targets to anchors
         t = targets * gain
         if nt:
@@ -1059,6 +1058,14 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
 
     b, a = butter_lowpass(cutoff, fs, order=order)
     return filtfilt(b, a, data)  # forward-backward filter
+
+def plot_one_box_notxt(x, img, color=None, label=None, line_thickness=None):
+    # Plots one bounding box on image img
+    tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+    color = color or [random.randint(0, 255) for _ in range(3)]
+    c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    return img 
 
 
 def plot_one_box(x, img, color=None, label=None, line_thickness=None):
@@ -1619,3 +1626,125 @@ def plot_results(start=0, stop=0, bucket='', id=(), labels=(), save_dir=''):
     fig.tight_layout()
     ax[1].legend()
     fig.savefig(Path(save_dir) / 'results.png', dpi=200)
+
+
+
+
+def compute_losst(p, targets, model):  # predictions, targets, model
+    device = targets.device
+    lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
+    tcls, tbox, indices, anchors = build_targetst(p, targets, model)  # targets
+    h = model.hyp  # hyperparameters
+
+    # Define criteria
+    BCEcls = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['cls_pw']])).to(device)
+    BCEobj = nn.BCEWithLogitsLoss(pos_weight=torch.Tensor([h['obj_pw']])).to(device)
+
+    # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
+    cp, cn = smooth_BCE(eps=0.0)
+
+    # Focal loss
+    g = h['fl_gamma']  # focal loss gamma
+    if g > 0:
+        BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+
+    # Losses
+    nt = 0  # number of targets
+    np = len(p)  # number of outputs
+    balance = [4.0, 1.0, 0.4] if np == 3 else [4.0, 1.0, 0.4, 0.1]  # P3-5 or P3-6
+    for i, pi in enumerate(p):  # layer index, layer predictions
+        b, a, gj, gi = indices[i]  # image, anchor, gridy, gridx
+        tobj = torch.zeros_like(pi[..., 0], device=device)  # target obj
+
+        n = b.shape[0]  # number of targets
+        if n:
+            nt += n  # cumulative targets
+            ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
+
+            # Regression
+            pxy = ps[:, :2].sigmoid() * 2. - 0.5
+            pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
+            pbox = torch.cat((pxy, pwh), 1).to(device)  # predicted box
+            iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
+            lbox += (1.0 - iou).mean()  # iou loss
+
+            # Objectness
+            tobj[b, a, gj, gi] = (1.0 - model.gr) + model.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
+
+            # Classification
+            if model.nc > 1:  # cls loss (only if multiple classes)
+                t = torch.full_like(ps[:, 5:], cn, device=device)  # targets
+                t[range(n), tcls[i]] = cp
+                lcls += BCEcls(ps[:, 5:], t)  # BCE
+
+            # Append targets to text file
+            # with open('targets.txt', 'a') as file:
+            #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
+
+        lobj += BCEobj(pi[..., 4], tobj) * balance[i]  # obj loss
+
+    s = 3 / np  # output count scaling
+    lbox *= h['box'] * s
+    lobj *= h['obj'] * s * (1.4 if np == 4 else 1.)
+    lcls *= h['cls'] * s
+    bs = tobj.shape[0]  # batch size
+
+    loss = lbox + lobj + lcls
+    return loss * bs, torch.cat((lbox, lobj, lcls, loss)).detach()
+
+
+def build_targetst(p, targets, model):
+    # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
+    det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
+    na, nt = det.na, targets.shape[0]  # number of anchors, targets
+    tcls, tbox, indices, anch = [], [], [], []
+    gain = torch.ones(7, device=targets.device)  # normalized to gridspace gain
+    ai = torch.arange(na, device=targets.device).float().view(na, 1).repeat(1, nt)  # same as .repeat_interleave(nt)
+    targets = torch.cat((targets.repeat(na, 1, 1), ai[:, :, None]), 2)  # append anchor indices
+
+    g = 0.5  # bias
+    off = torch.tensor([[0, 0],
+                        [1, 0], [0, 1], [-1, 0], [0, -1],  # j,k,l,m
+                        # [1, 1], [1, -1], [-1, 1], [-1, -1],  # jk,jm,lk,lm
+                        ], device=targets.device).float() * g  # offsets
+
+    for i in range(det.nl):
+        anchors = det.anchors[i]
+        gain[2:6] = torch.tensor(p[i].shape)[[3, 2, 3, 2]]  # xyxy gain
+
+        # Match targets to anchors
+        t = targets * gain
+        if nt:
+            # Matches
+            r = t[:, :, 4:6] / anchors[:, None]  # wh ratio
+            j = torch.max(r, 1. / r).max(2)[0] < model.hyp['anchor_t']  # compare
+            # j = wh_iou(anchors, t[:, 4:6]) > model.hyp['iou_t']  # iou(3,n)=wh_iou(anchors(3,2), gwh(n,2))
+            t = t[j]  # filter
+
+            # Offsets
+            gxy = t[:, 2:4]  # grid xy
+            gxi = gain[[2, 3]] - gxy  # inverse
+            j, k = ((gxy % 1. < g) & (gxy > 1.)).T
+            l, m = ((gxi % 1. < g) & (gxi > 1.)).T
+            j = torch.stack((torch.ones_like(j), j, k, l, m))
+            t = t.repeat((5, 1, 1))[j]
+            offsets = (torch.zeros_like(gxy)[None] + off[:, None])[j]
+        else:
+            t = targets[0]
+            offsets = 0
+
+        # Define
+        b, c = t[:, :2].long().T  # image, class
+        gxy = t[:, 2:4]  # grid xy
+        gwh = t[:, 4:6]  # grid wh
+        gij = (gxy - offsets).long()
+        gi, gj = gij.T  # grid xy indices
+
+        # Append
+        a = t[:, 6].long()  # anchor indices
+        indices.append((b, a, gj, gi))  # image, anchor, grid indices
+        tbox.append(torch.cat((gxy - gij, gwh), 1))  # box
+        anch.append(anchors[a])  # anchors
+        tcls.append(c)  # class
+
+    return tcls, tbox, indices, anch

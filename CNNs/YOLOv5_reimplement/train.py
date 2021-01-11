@@ -166,7 +166,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
     # Exponential moving average
     ema = ModelEMA(model) if rank in [-1, 0] else None
-
+    ema = None 
     # DDP mode
     if cuda and rank != -1:
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
@@ -182,7 +182,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
     # Process 0
     if rank in [-1, 0]:
-        ema.updates = start_epoch * nb // accumulate  # set EMA updates
+        if ema : 
+               ema.updates = start_epoch * nb // accumulate  # set EMA updates
         testloader = create_dataloader(test_path, imgsz_test, total_batch_size, gs, opt,
                                        hyp=hyp, augment=False, cache=opt.cache_images and not opt.notest, rect=True,
                                        rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
@@ -198,28 +199,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 tb_writer.add_histogram('classes', c, 0)
 
             # Anchors
-            """
-            if not opt.noautoanchor:
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                print("--------------------------")
-                check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
-            """
+            #if not opt.noautoanchor:
+            #check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
     # Model parameters
     hyp['cls'] *= nc / 80.  # scale coco-tuned hyp['cls'] to current dataset
     model.nc = nc  # attach number of classes to model
@@ -241,7 +222,15 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, log_dir, epochs))
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
-
+        wts = [] 
+        for param in model.model.parameters(): 
+            weights_tens = param.data 
+            weights_np = weights_tens.cpu().numpy()
+            weights_list = weights_np.tolist()
+            wts.append(weights_list) 
+        np_wts = np.asarray(wts)
+        import pdb;pdb.set_trace()
+        np.savetxt("train.txt",np_wts,fmt='%s')
         # Update image weights (optional)
         if opt.image_weights:
             # Generate indices
@@ -281,7 +270,6 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
-
             # Multi-scale
             if opt.multi_scale:
                 sz = random.randrange(imgsz * 0.5, imgsz * 1.5 + gs) // gs * gs  # size
@@ -293,19 +281,21 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # Forward
             print("Training Step") 
             with amp.autocast(enabled=False):
+                
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_losst(pred, targets.to(device), model)  # loss scaled by batch_size
-                
-                import pdb; pdb.set_trace()
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
             
             # Backward
             scaler.scale(loss).backward()
 
+            print("loss : ",loss) 
             # Optimize
             scaler.step(optimizer)  # optimizer.step
             scaler.update()
+            
+            import pdb; pdb.set_trace()
             optimizer.zero_grad()
             if ema:
                 ema.update(model)
@@ -338,15 +328,26 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             if ema:
                 ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride'])
             final_epoch = epoch + 1 == epochs
+
             if not opt.notest or final_epoch:  # Calculate mAP
-                results, maps, times = test.test(opt.data,
-                                                 batch_size=total_batch_size,
-                                                 imgsz=imgsz_test,
-                                                 model=ema.ema,
-                                                 single_cls=opt.single_cls,
-                                                 dataloader=testloader,
-                                                 save_dir=log_dir,
-                                                 plots=epoch == 0 or final_epoch)
+                if ema : 
+                    results, maps, times = test.test(opt.data,
+                                                     batch_size=total_batch_size,
+                                                     imgsz=imgsz_test,
+                                                     model=ema.ema,
+                                                     single_cls=opt.single_cls,
+                                                     dataloader=testloader,
+                                                     save_dir=log_dir,
+                                                     plots=epoch == 0 or final_epoch)
+                else :
+                    results, maps, times = test.test(opt.data,
+                                                     batch_size=total_batch_size,
+                                                     imgsz=imgsz_test,
+                                                     model=model,
+                                                     single_cls=opt.single_cls,
+                                                     dataloader=testloader,
+                                                     save_dir=log_dir,
+                                                     plots=epoch == 0 or final_epoch)
 
             # Write
             with open(results_file, 'a') as f:
@@ -377,7 +378,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     ckpt = {'epoch': epoch,
                             'best_fitness': best_fitness,
                             'training_results': f.read(),
-                            'model': ema.ema,
+                            'model': model,
                             'optimizer': None if final_epoch else optimizer.state_dict(),
                             'wandb_id': wandb_run.id if wandb else None}
 

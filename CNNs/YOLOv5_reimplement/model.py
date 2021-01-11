@@ -112,7 +112,6 @@ class Model(pl.LightningModule):
         self.config()
         self.load_model()
         
-        self.optimizer, self.lr_scheduler = self.configure_optimizers()
         self.info()
         self.run_save()
         self.wandb_logging()
@@ -183,7 +182,7 @@ class Model(pl.LightningModule):
         if self.pretrained: 
             # Optimizer
             if self.ckpt['optimizer'] is not None:
-                self.optimizer.load_state_dict(self.ckpt['optimizer'])
+                #self.optimizer.load_state_dict(self.ckpt['optimizer'])
                 best_fitness = self.ckpt['best_fitness']
 
             # Results
@@ -241,10 +240,10 @@ class Model(pl.LightningModule):
 
 
     def train_inits(self):     
-        self.batch_count = 0 
         # Epochs
         # Exponential moving average
         self.ema = self.emaModel() if self.rank in [-1, 0] else None
+        self.ema = None
         # DDP mode
         if self.opt.local_rank != -1:
             self.model = DDP(self.model, device_ids=[self.opt.local_rank], output_device=self.opt.local_rank)
@@ -252,7 +251,8 @@ class Model(pl.LightningModule):
 
         # Process 0
         if self.rank in [-1, 0]:
-            self.ema.updates = self.start_epoch * self.nb // self.accumulate  # set EMA updates
+            if self.ema : 
+               self.ema.updates = self.start_epoch * self.nb // self.accumulate  # set EMA updates
 
             if not self.opt.resume:
                 labels = np.concatenate(self.dataset.labels, 0)
@@ -480,25 +480,25 @@ class Model(pl.LightningModule):
         optimizer.add_param_group({'params': pg1, 'weight_decay': self.hyp['weight_decay']})  # add pg1 with weight_decay
         optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
         logger.info('Optimizer groups: %g .bias, %g conv.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
-        del pg0, pg1, pg2
         self.lf = lambda x: ((1 + math.cos(x * math.pi / self.epochs)) / 2) * (1 - hyp['lrf']) + hyp['lrf']  # cosine
         scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=self.lf)
-
+        
+        del pg0, pg1, pg2
         return [optimizer],[scheduler]
     
     
 
 
     def training_step(self,batch,batch_idx):
+            self.model.train()
             
-            optims = self.configure_optimizers()
-            optimizer, self.lr_scheduler = optims[0][0],optims[1][0]
             self.batch_count = 0 
             imgs, targets, paths, _ = batch
             ni = batch_idx + self.nb * self.current_epoch  # number integrated batches (since train start)
             imgs = imgs.float() / 255.0  # uint8 to float32, 0-255 to 0.0-1.0
             self.mloss = torch.zeros(4,device=imgs.device) 
 
+            """
             # Warmup
             if ni <= self.nw:
                 xi = [0,self.nw]  # x interp
@@ -509,7 +509,6 @@ class Model(pl.LightningModule):
                     x['lr'] = np.interp(ni, xi, [self.hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * self.lf(self.current_epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [self.hyp['warmup_momentum'], self.hyp['momentum']])
-            
             # Multi-scale
             if self.opt.multi_scale:
                 sz = random.randrange(self.imgsz * 0.5, self.imgsz * 1.5 + self.gs) // self.gs * self.gs  # size
@@ -517,27 +516,22 @@ class Model(pl.LightningModule):
                 if sf != 1:
                     ns = [math.ceil(x * sf / self.gs) * self.gs for x in self.imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(self.imgs, size=ns, mode='bilinear', align_corners=False)
-            
+            """
             # Forward
             with amp.autocast(enabled=False):
                 
-
                 pred = self.forward(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets, self.model)  # loss scaled by batch_size
-                
                 if self.rank != -1:
                     loss *= self.opt.world_size  # gradient averaged between devices in DDP mode
-            
+               
             # Backward
-            self.scaler.scale(loss).backward()
+            #self.scaler.scale(loss).backward()
             # Optimize
              
-            self.scaler.step(optimizer)  # optimizer.step
-            self.scaler.update()
-            optimizer.zero_grad()
             if self.ema:
                 self.ema_update()
-       
+            print("loss", loss) 
             # Print
             if self.rank in [-1, 0]:
                 self.mloss = (self.mloss * self.batch_count + loss_items) / (self.batch_count + 1)  # update mean losses
@@ -545,11 +539,11 @@ class Model(pl.LightningModule):
                 self.s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (self.current_epoch, self.epochs - 1), mem, *self.mloss, targets.shape[0], imgs.shape[-1])
                 self.log("train_loss" , loss) 
+            return loss 
 
     def on_epoch_end(self): 
                 print("epoch end") 
                 # Scheduler
-                self.lr_scheduler.step()
 
                 results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
                 # DDP process 0 or single-GPU
@@ -590,7 +584,7 @@ class Model(pl.LightningModule):
                             ckpt = {'epoch': self.current_epoch,
                                     'best_fitness': self.best_fitness,
                                     'training_results': f.read(),
-                                    'model': self.ema,
+                                    'model': self.model,
                                     'wandb_id': None}
 
                         # Save last, best and delete
@@ -604,7 +598,7 @@ class Model(pl.LightningModule):
              batch_size=16,
              imgsz=640,
              conf_thres=0.001,
-             iou_thres=0.6,  # for NMS
+             iou_thres=0.5,  # for NMS
              save_json=False,
              single_cls=False,
              augment=False,

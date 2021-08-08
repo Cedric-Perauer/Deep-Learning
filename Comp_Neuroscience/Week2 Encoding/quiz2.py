@@ -21,10 +21,17 @@ with open(FILENAME, 'rb') as f:
 stim = data['stim']
 rho = data['rho']
 
+c = 0 
+for idx,i in enumerate(rho) : 
+    if i == 1 and idx > 150 :
+        c += 1
+
+        
+
 
 # Fill in these values
-sampling_period = # in ms
-num_timesteps = 
+sampling_period = 2 # in ms
+num_timesteps = 150  
 
 sta = compute_sta(stim, rho, num_timesteps)
 

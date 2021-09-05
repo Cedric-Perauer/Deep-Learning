@@ -23,7 +23,7 @@ import util.misc as utils
 import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
-from models import build_model
+from models import build 
 
 
 def get_args_parser():
@@ -144,7 +144,6 @@ def main(args):
     dataset_train = build_dataset(image_set='train', args=args)
     dataset_val = build_dataset(image_set='val', args=args)
 
-
     # lr_backbone_names = ["backbone.0", "backbone.neck", "input_proj", "transformer.encoder"]
     def match_name_keywords(n, name_keywords):
         out = False
@@ -154,7 +153,8 @@ def main(args):
                 break
         return out
 
-
+    model, processors = build(args,dataset_train,dataset_val)
+    """
     param_dicts = [
         {
             "params":
@@ -184,11 +184,13 @@ def main(args):
         model_without_ddp.detr.load_state_dict(checkpoint['model'])
 
     output_dir = Path(args.output_dir)
-    
+    """
+
 
 
     print("Start training")
     start_time = time.time()
+    model = DeformableDETR()
     trainer = pl.Trainer()
     trainer.fit(model) 
 

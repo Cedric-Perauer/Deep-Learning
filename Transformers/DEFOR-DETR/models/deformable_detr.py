@@ -28,7 +28,7 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
 from .deformable_transformer import build_deforamble_transformer
 import copy
-from torch.utils import DataLoader
+from torch.utils.data import DataLoader
 
 
 def _get_clones(module, N):
@@ -512,7 +512,7 @@ class MLP(nn.Module):
         return x
 
 
-def build(args):
+def build(args,dataset_train,dataset_val):
     num_classes = 20 if args.dataset_file != 'coco' else 91
     if args.dataset_file == "coco_panoptic":
         num_classes = 250
@@ -530,6 +530,8 @@ def build(args):
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
+        batch_sampler_train = torch.utils.data.RandomSampler(dataset_train) , 
+        val_sampler = torch.utils.data.RandomSampler(dataset_val)  
     )
     #if args.masks:
     #    model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

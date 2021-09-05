@@ -29,6 +29,15 @@ from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
 from .deformable_transformer import build_deforamble_transformer
 import copy
 from torch.utils.data import DataLoader
+import util.misc as utils 
+
+def match_name_keywords(n, name_keywords):
+        out = False
+        for b in name_keywords:
+            if b in n:
+                out = True
+                break
+        return out
 
 
 def _get_clones(module, N):
@@ -39,7 +48,7 @@ class DeformableDETR(pl.LightningModule):
     """ This is the Deformable DETR module that performs object detection """
     def __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
                  aux_loss=True, with_box_refine=False, two_stage=False,batch_sampler_train=None,val_sampler=None,
-                 num_workers=2,args=None,param_dicts=None):
+                 num_workers=2,args=None,param_dicts=None,dataset_train=None,dataset_val=None,dataset_test=None):
         """ Initializes the model.
         Parameters:
             backbone: torch module of the backbone to be used. See backbone.py
@@ -53,7 +62,10 @@ class DeformableDETR(pl.LightningModule):
         """
         super().__init__()
         self.args = args
-        self.matcher = build_matcher(args)
+        self.dataset_train = dataset_train
+        self.dataset_val = dataset_val
+        self.dataset_test = dataset_test
+        self.matcher = build_matcher(self.args)
         self.weight_dict = {'loss_ce': args.cls_loss_coef, 'loss_bbox': args.bbox_loss_coef}
         self.weight_dict['loss_giou'] = args.giou_loss_coef
         losses = ['labels', 'boxes', 'cardinality']
@@ -235,25 +247,43 @@ class DeformableDETR(pl.LightningModule):
         return losses      
 
 
-    def train_datalodaer(self): 
-        cooc_train = DataLoader(self.dataset_train,collate_fn=utils.collate_fn,
+    def train_dataloader(self): 
+        coco_train = DataLoader(self.dataset_train,collate_fn=utils.collate_fn,
                                  num_workers=self.num_workers,pin_memory=True)
         return coco_train 
 
-    def val_datalodaer(self): 
+    def val_dataloader(self): 
         coco_val = DataLoader(self.dataset_val,batch_size = self.batch_size,
                               drop_last=False,collate_fn=utils.collate_fn,num_workers=self.num_workers,pin_memory=True)
         return coco_val
 
-    def test_dataldata(self):
+    def test_dataloader(self):#not configured yet
         coco_test = DataLoader(self.dataset_val,batch_size = self.batch_size,sampler=self.val_sampler,
                               drop_last=False,collate_fn=utils.collate_fn,num_workers=self.num_workers,pin_memory=True)
         return coco_test
     
     def configure_optimizers(self): 
-       optimizer = torch.optim.AdamW(self.param_dicts, lr=self.args.lr,weight_decay=self.args.weight_decay) 
-       lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,self.args.drop_lr) 
-       return [optimizer, lr_scheduler]
+       param_dicts = [
+        {
+            "params":
+                [p for n, p in self.named_parameters()
+                 if not match_name_keywords(n, self.args.lr_backbone_names) and not match_name_keywords(n, self.args.lr_linear_proj_names) and p.requires_grad],
+            "lr": self.args.lr,
+        },
+        {
+            "params": [p for n, p in self.named_parameters() if match_name_keywords(n, self.args.lr_backbone_names) and p.requires_grad],
+            "lr": self.args.lr_backbone,
+        },
+        {
+            "params": [p for n, p in self.named_parameters() if match_name_keywords(n, self.args.lr_linear_proj_names) and p.requires_grad],
+            "lr": self.args.lr * self.args.lr_linear_proj_mult,
+        }
+        ]
+    
+       optimizer = torch.optim.AdamW(param_dicts, lr=self.args.lr,weight_decay=self.args.weight_decay) 
+       lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer,self.args.lr_drop) 
+       
+       return [optimizer], [lr_scheduler]
 
 
     @torch.jit.unused
@@ -519,8 +549,9 @@ def build(args,dataset_train,dataset_val):
     device = torch.device(args.device)
 
     backbone = build_backbone(args)
-
+   
     transformer = build_deforamble_transformer(args)
+    print("Build Transformer and Backbone done") 
     model = DeformableDETR(
         backbone,
         transformer,
@@ -531,7 +562,8 @@ def build(args,dataset_train,dataset_val):
         with_box_refine=args.with_box_refine,
         two_stage=args.two_stage,
         batch_sampler_train = torch.utils.data.RandomSampler(dataset_train) , 
-        val_sampler = torch.utils.data.RandomSampler(dataset_val)  
+        val_sampler = torch.utils.data.RandomSampler(dataset_val), 
+        args = args,dataset_train=dataset_train,dataset_val=dataset_val
     )
     #if args.masks:
     #    model = DETRsegm(model, freeze_detr=(args.frozen_weights is not None))

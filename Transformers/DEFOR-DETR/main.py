@@ -24,7 +24,7 @@ import datasets.samplers as samplers
 from datasets import build_dataset, get_coco_api_from_dataset
 from engine import evaluate, train_one_epoch
 from models import build 
-
+import pytorch_lightning as pil 
 
 def get_args_parser():
     parser = argparse.ArgumentParser('Deformable DETR Detector', add_help=False)
@@ -154,6 +154,7 @@ def main(args):
         return out
 
     model, processors = build(args,dataset_train,dataset_val)
+    print(model) 
     """
     param_dicts = [
         {
@@ -190,8 +191,7 @@ def main(args):
 
     print("Start training")
     start_time = time.time()
-    model = DeformableDETR()
-    trainer = pl.Trainer()
+    trainer = pil.Trainer(gpus=-1)
     trainer.fit(model) 
 
     total_time = time.time() - start_time

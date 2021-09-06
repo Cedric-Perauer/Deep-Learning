@@ -223,18 +223,18 @@ class DeformableDETR(pl.LightningModule):
         loss_dict = self.criterion(outputs, targets)
         weight_dict = self.criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-
-        if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+        loss = losses 
+        if not math.isfinite(losses):
+            print("Loss is {}, stopping training".format(losses))
             print(loss_dict_reduced)
             sys.exit(1)
 
         #optimizer.zero_grad()
         #losses.backward()
-        if max_norm > 0:
-            grad_total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm)
+        if self.args.clip_max_norm > 0:
+            grad_total_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), self.args.clip_max_norm)
         else:
-            grad_total_norm = utils.get_total_grad_norm(self.parameters(), max_norm)
+            grad_total_norm = utils.get_total_grad_norm(self.parameters(), self.args.clip_max_norm)
 
         #metric_logger.update(loss=loss_value, **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
         #metric_logger.update(class_error=loss_dict_reduced['class_error'])
@@ -243,8 +243,8 @@ class DeformableDETR(pl.LightningModule):
 
         # gather the stats from all processes
         #metric_logger.synchronize_between_processes()
-        print("Averaged stats:", metric_logger)
-        return losses      
+        #print("Averaged stats:", metric_logger)
+        return loss      
 
 
     def train_dataloader(self): 
